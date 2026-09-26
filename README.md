@@ -33,7 +33,7 @@ make
 make install
 ```
 
-This installs `termux-http-proxy` into `$PREFIX/bin` (and sets up a compatibility symlink `dns-proxy -> termux-http-proxy`).
+This installs `termux-http-proxy` and `termux-http-proxy-ctl` into `$PREFIX/bin`. Earlier copies of this proxy, bundled with claude-code-termux-musl, agy-termux-musl and codex-termux, were called `dns-proxy`.
 
 ## Usage
 
@@ -64,12 +64,18 @@ termux-http-proxy --port 18080          # detaches
 termux-http-proxy -f 18080              # stays in the foreground, for runit/termux-services
 ```
 
-A runit service (`$PREFIX/var/service/<name>/run`) looks like:
+A runit service (`$PREFIX/var/service/termux-http-proxy/run`) looks like:
 
 ```sh
 #!/data/data/com.termux/files/usr/bin/sh
-exec termux-http-proxy -f 18080 --auth-file "$HOME/.config/termux-http-proxy/token" 2>&1
+exec 2>&1
+TOKEN=/data/data/com.termux/files/home/.config/termux-http-proxy/token
+mkdir -p "${TOKEN%/*}" && chmod 700 "${TOKEN%/*}"
+exec /data/data/com.termux/files/usr/bin/termux-http-proxy -f 18080 --auth-file "$TOKEN"
 ```
+
+`termux-http-proxy-ctl {start|stop|restart|status}` manages the daemon on port 18080:
+through `sv` when that service exists, otherwise as a detached process.
 
 ## Security
 

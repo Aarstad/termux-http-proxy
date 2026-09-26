@@ -13,14 +13,16 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $<
 
+# The new file is renamed over the old one rather than written in place, so a proxy
+# that is running keeps its executable and the replacement is used on its next start.
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
-	ln -sf $(TARGET) $(DESTDIR)$(BINDIR)/dns-proxy
+	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/.$(TARGET).new
+	mv -f $(DESTDIR)$(BINDIR)/.$(TARGET).new $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -m 755 $(TARGET)-ctl $(DESTDIR)$(BINDIR)/$(TARGET)-ctl
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
-	rm -f $(DESTDIR)$(BINDIR)/dns-proxy
+	rm -f $(DESTDIR)$(BINDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)-ctl
 
 # test_proxy.py also builds and runs the C suites (tests/test_units.c, tests/test_event_loop.c).
 test:

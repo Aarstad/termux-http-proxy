@@ -1,0 +1,71 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# termux-http-proxy-ctl — start, stop or check the shared proxy on 127.0.0.1:18080.
+#
+# If a termux-services (runit) service is set up, this hands over to sv, so the two
+# never both try to own the port. Otherwise it runs the proxy as a detached daemon.
+# Clients must present the token in $TOKEN_FILE; the launchers read it from there.
+set -euo pipefail
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+PROXY="$PREFIX/bin/termux-http-proxy"
+PORT=18080
+TOKEN_FILE="${TERMUX_PROXY_TOKEN_FILE:-$HOME/.config/termux-http-proxy/token}"
+SERVICE="$PREFIX/var/service/termux-http-proxy"
+PIDFILE="$PREFIX/var/run/termux-http-proxy.pid"
+
+listening() { nc -z 127.0.0.1 "$PORT" 2>/dev/null; }
+
+if [ -d "$SERVICE" ]; then
+  case "${1:-status}" in
+    start)   exec sv up "$SERVICE" ;;
+    stop)    exec sv down "$SERVICE" ;;
+    restart) exec sv restart "$SERVICE" ;;
+    status)  exec sv status "$SERVICE" ;;
+    *)       echo "usage: termux-http-proxy-ctl {start|stop|restart|status}" >&2; exit 2 ;;
+  esac
+fi
+
+status() {
+  if listening; then
+    echo "termux-http-proxy: running on 127.0.0.1:$PORT (PID $(cat "$PIDFILE" 2>/dev/null || echo unknown))"
+  else
+    echo "termux-http-proxy: stopped"
+    return 1
+  fi
+}
+
+start() {
+  if listening; then
+    echo "termux-http-proxy: already running on 127.0.0.1:$PORT"
+    return 0
+  fi
+  mkdir -p "$(dirname "$PIDFILE")" "${TOKEN_FILE%/*}"
+  chmod 700 "${TOKEN_FILE%/*}"
+  "$PROXY" "$PORT" --auth-file "$TOKEN_FILE" # Detaches once listening
+  sleep 0.2
+  local pid
+  pid="$(pgrep -xf "$PROXY $PORT --auth-file $TOKEN_FILE" | head -1 || true)"
+  [ -n "$pid" ] && echo "$pid" > "$PIDFILE"
+  if listening; then
+    echo "termux-http-proxy: started on 127.0.0.1:$PORT (PID ${pid:-unknown})"
+  else
+    echo "termux-http-proxy: failed to start" >&2
+    return 1
+  fi
+}
+
+stop() {
+  if [ -f "$PIDFILE" ]; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+    rm -f "$PIDFILE"
+  fi
+  echo "termux-http-proxy: stopped"
+}
+
+case "${1:-status}" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) stop; sleep 0.3; start ;;
+  status)  status ;;
+  *)       echo "usage: termux-http-proxy-ctl {start|stop|restart|status}" >&2; exit 2 ;;
+esac
