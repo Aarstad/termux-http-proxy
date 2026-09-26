@@ -127,6 +127,15 @@ All builds happen in temporary directories under AddressSanitizer (`-fsanitize=a
 * **`tests/test_event_loop.c`** — runs the real event loop with a fake resolver and a `connect()` that can blackhole chosen addresses: a stalled lookup does not block other clients, NXDOMAIN, a partial A/AAAA answer is dialed after the resolution delay (and an empty one starts no delay), a blackholed address falls through to the next, all-blackholed times out with `504`, IPv4-first ordering, clients hanging up mid-lookup, and IPv6 dialing.
 * **`tests/measure_memory.py`** — RSS/PSS footprint benchmark, optionally against a Bun implementation (`--bun-js`).
 
+## Used by
+
+Each of these bundles a copy of `termux-http-proxy.c` for its own fallback proxy, and
+shares the daemon on port 18080 when it is running:
+
+* [claude-code-termux-musl](https://github.com/Aarstad/claude-code-termux-musl) — Anthropic's Claude Code
+* [codex-termux](https://github.com/Aarstad/codex-termux) — OpenAI's Codex CLI
+* [agy-termux-musl](https://github.com/Aarstad/agy-termux-musl) — Google's Antigravity CLI
+
 ## License
 
 MIT
