@@ -1,6 +1,13 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # termux-http-proxy-ctl — start, stop or check the shared proxy on 127.0.0.1:18080.
 #
+#   termux-http-proxy-ctl {start|stop|restart|status}
+#   termux-http-proxy-ctl check [--local] [--quiet]
+#
+# check exits 0 when clients can use the proxy: it is listening, the token file is
+# usable, a request without the token is refused, and (unless --local, which stays
+# on the device) one with the token reaches the internet.
+#
 # If a termux-services (runit) service is set up, this hands over to sv, so the two
 # never both try to own the port. Otherwise it runs the proxy as a detached daemon.
 # Clients must present the token in $TOKEN_FILE; the launchers read it from there.
@@ -8,12 +15,75 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 PROXY="$PREFIX/bin/termux-http-proxy"
-PORT=18080
+PORT="${TERMUX_PROXY_PORT:-18080}"
 TOKEN_FILE="${TERMUX_PROXY_TOKEN_FILE:-$HOME/.config/termux-http-proxy/token}"
-SERVICE="$PREFIX/var/service/termux-http-proxy"
+SERVICE="${SVDIR:-$PREFIX/var/service}/termux-http-proxy"
 PIDFILE="$PREFIX/var/run/termux-http-proxy.pid"
 
 listening() { nc -z 127.0.0.1 "$PORT" 2>/dev/null; }
+
+check() {
+  local local_only=0 quiet=0 failed=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --local) local_only=1 ;;
+      --quiet) quiet=1 ;;
+      *) echo "usage: termux-http-proxy-ctl check [--local] [--quiet]" >&2; return 2 ;;
+    esac
+  done
+  ok()   { [ "$quiet" = 1 ] || printf '  ok    %s\n' "$*"; }
+  warn() { [ "$quiet" = 1 ] || printf '  warn  %s\n' "$*"; }
+  bad()  { printf '  FAIL  %s\n' "$*" >&2; failed=1; }
+
+  if listening; then ok "listening on 127.0.0.1:$PORT"
+  else bad "nothing listening on 127.0.0.1:$PORT (launchers fall back to their own proxy)"; fi
+
+  local token="" mode
+  if [ -f "$TOKEN_FILE" ]; then
+    mode="$(stat -c %a "$TOKEN_FILE")"
+    token="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+    if [ "$mode" != 600 ] && [ "$mode" != 400 ]; then
+      bad "$TOKEN_FILE is mode $mode; the proxy refuses it (chmod 600)"
+    elif [ "${#token}" -lt 16 ]; then
+      bad "$TOKEN_FILE holds no usable token (under 16 characters)"
+    else
+      ok "token file $TOKEN_FILE (mode $mode)"
+    fi
+  else
+    warn "no token file at $TOKEN_FILE (created when the proxy starts with --auth-file)"
+  fi
+
+  if listening; then
+    # Refused before any lookup, so this needs no network.
+    local bare
+    bare="$(curl -s -o /dev/null -w '%{http_connect}' -m 5 -x "http://127.0.0.1:$PORT" https://example.com || true)"
+    case "$bare" in
+      407) ok "requests without the token are refused (407)" ;;
+      200) warn "requests without the token are accepted: the proxy is running without --auth-file" ;;
+      *)   bad "unexpected reply to a request without the token: '$bare'" ;;
+    esac
+
+    if [ "$local_only" = 0 ] && [ -n "$token" ]; then
+      local with direct
+      with="$(curl -s -o /dev/null -w '%{http_code}' -m 15 -x "http://proxy:$token@127.0.0.1:$PORT" https://example.com || true)"
+      case "$with" in
+        000|407)
+          # Tell a broken proxy from a phone without a network.
+          direct="$(curl -s -o /dev/null -w '%{http_code}' -m 10 https://example.com || true)"
+          if [ "$direct" = 000 ]; then warn "no network right now, so the path out could not be tested"
+          else bad "a request with the token failed ('$with') while the network works"; fi ;;
+        *) ok "a request with the token reaches the internet ($with)" ;;
+      esac
+    fi
+  fi
+  return "$failed"
+}
+
+if [ "${1:-}" = check ]; then
+  shift
+  check "$@"
+  exit
+fi
 
 if [ -d "$SERVICE" ]; then
   case "${1:-status}" in
@@ -21,7 +91,7 @@ if [ -d "$SERVICE" ]; then
     stop)    exec sv down "$SERVICE" ;;
     restart) exec sv restart "$SERVICE" ;;
     status)  exec sv status "$SERVICE" ;;
-    *)       echo "usage: termux-http-proxy-ctl {start|stop|restart|status}" >&2; exit 2 ;;
+    *)       echo "usage: termux-http-proxy-ctl {start|stop|restart|status|check}" >&2; exit 2 ;;
   esac
 fi
 
@@ -67,5 +137,5 @@ case "${1:-status}" in
   stop)    stop ;;
   restart) stop; sleep 0.3; start ;;
   status)  status ;;
-  *)       echo "usage: termux-http-proxy-ctl {start|stop|restart|status}" >&2; exit 2 ;;
+  *)       echo "usage: termux-http-proxy-ctl {start|stop|restart|status|check}" >&2; exit 2 ;;
 esac

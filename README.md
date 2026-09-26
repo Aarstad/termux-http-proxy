@@ -76,6 +76,10 @@ exec /data/data/com.termux/files/usr/bin/termux-http-proxy -f 18080 --auth-file 
 
 `termux-http-proxy-ctl {start|stop|restart|status}` manages the daemon on port 18080:
 through `sv` when that service exists, otherwise as a detached process.
+`termux-http-proxy-ctl check` reports whether clients can use it: listening, a usable
+token file, requests without the token refused, and one with the token reaching the
+internet (`--local` skips that last, network-dependent step). It exits non-zero on a
+problem, so startup scripts can act on it.
 
 ## Security
 
