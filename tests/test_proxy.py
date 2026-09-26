@@ -2,15 +2,54 @@
 
 Run: python3 tests/test_proxy.py
 Requires cc with AddressSanitizer support. Builds only in a temporary directory.
+PROXY_NETWORK_TESTS=1 also runs tests that resolve real names over the network.
 """
+import base64
 import os
 import concurrent.futures
 import time
 from pathlib import Path
 import socket
+import stat
 import subprocess
 import tempfile
 import unittest
+
+SOURCE = str(Path(os.environ.get(
+    'PROXY_SOURCE', Path(__file__).resolve().parents[1] / 'termux-http-proxy.c')).resolve())
+
+
+def build(directory, name, *defines):
+    binary = str(Path(directory) / name)
+    subprocess.run(['cc', '-Wall', '-Wextra', '-Wpedantic', '-O1', '-g',
+                    '-fsanitize=address', *defines, '-o', binary, SOURCE], check=True)
+    return binary
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def wait_listening(port, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
+            return
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError(f'nothing listening on {port}')
+
+
+def has_ipv6_loopback():
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(('::1', 0))
+        return True
+    except OSError:
+        return False
 
 
 class ProxyTests(unittest.TestCase):
@@ -18,11 +57,8 @@ class ProxyTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix='proxy-test-')
         cls.addClassCleanup(cls.temp.cleanup)
-        cls.binary = str(Path(cls.temp.name) / 'proxy')
-        source = os.environ.get('PROXY_SOURCE', str(Path(__file__).resolve().parents[1] / 'termux-http-proxy.c'))
-        cls.source = str(Path(source).resolve())
-        subprocess.run(['cc', '-Wall', '-Wextra', '-Wpedantic', '-O1', '-g',
-                        '-fsanitize=address', '-o', cls.binary, source], check=True)
+        cls.source = SOURCE
+        cls.binary = build(cls.temp.name, 'proxy')
 
     def setUp(self):
         self.proxy = subprocess.Popen([self.binary], stdin=subprocess.PIPE,
@@ -130,12 +166,285 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(conn.recv(1), b'')
         self.assertEqual(self.client.recv(1), b'')
 
-    def test_setup_deadlines_and_backpressure(self):
-        binary = str(Path(self.temp.name) / 'deadlines')
+    def test_localhost_by_name(self):
+        self.client.sendall(f'CONNECT localhost:{self.server.getsockname()[1]} HTTP/1.1\r\n\r\n'.encode())
+        conn = self.upstream()
+        reply = b'HTTP/1.1 200 Connection Established\r\n\r\n'
+        self.assertEqual(self.receive(self.client, len(reply)), reply)
+        conn.sendall(b'hi')
+        self.assertEqual(self.receive(self.client, 2), b'hi')
+
+    @unittest.skipUnless(has_ipv6_loopback(), 'no IPv6 loopback')
+    def test_bracketed_ipv6_target(self):
+        with socket.socket(socket.AF_INET6) as server:
+            server.settimeout(3)
+            server.bind(('::1', 0))
+            server.listen()
+            self.client.sendall(f'CONNECT [::1]:{server.getsockname()[1]} HTTP/1.1\r\n\r\n'.encode())
+            conn, _ = server.accept()
+            self.addCleanup(conn.close)
+            reply = b'HTTP/1.1 200 Connection Established\r\n\r\n'
+            self.assertEqual(self.receive(self.client, len(reply)), reply)
+
+    def test_malformed_targets_rejected_before_dial(self):
+        for target in ('host:notaport', 'host:0', 'host:70000', '[::1', ''):
+            with self.subTest(target=target):
+                with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+                    client.sendall(f'CONNECT {target} HTTP/1.1\r\n\r\n'.encode())
+                    self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 400 '))
+
+    def test_unit_tests(self):
+        self.run_c_test('test_units.c')
+
+    def test_event_loop(self):
+        self.run_c_test('test_event_loop.c')
+
+    def run_c_test(self, name):
+        binary = str(Path(self.temp.name) / Path(name).stem)
         subprocess.run(['cc', '-Wall', '-Wextra', '-Wpedantic', '-O1', '-g',
                         '-fsanitize=address', f'-DPROXY_SOURCE="{self.source}"',
-                        '-o', binary, str(Path(__file__).with_name('test_deadlines.c'))], check=True)
-        subprocess.run([binary], check=True, timeout=5)
+                        '-o', binary, str(Path(__file__).with_name(name))], check=True)
+        subprocess.run([binary], check=True, timeout=60)
+
+
+class FootprintTests(unittest.TestCase):
+    """The release build stays small once its resolver is loaded.
+
+    Loading the async resolver through libandroid.so instead of libnetd_client.so
+    once took this from 3MB to 45MB RSS (1,187 mapped objects) with every other test
+    still passing. The limits are loose; they exist to catch that kind of jump.
+    """
+
+    def test_release_build_rss(self):
+        with tempfile.TemporaryDirectory(prefix='proxy-rss-') as tmp:
+            binary = str(Path(tmp) / 'proxy')
+            subprocess.run(['cc', '-O2', '-o', binary, SOURCE], check=True)
+            # The with block closes the pipes and waits, so no stream is left unclosed.
+            with subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE) as proxy:
+                try:
+                    int(proxy.stdout.readline())  # Past resolver_init() once the port is printed
+                    status = Path(f'/proc/{proxy.pid}/status').read_text()
+                    rss = int(next(l for l in status.splitlines() if l.startswith('VmRSS:')).split()[1])
+                    maps = Path(f'/proc/{proxy.pid}/maps').read_text()
+                    objects = {l.split()[-1] for l in maps.splitlines() if '.so' in l}
+                finally:
+                    proxy.terminate()
+            self.assertLess(rss, 8 * 1024, f'VmRSS {rss} kB')
+            self.assertLess(len(objects), 40, sorted(objects))
+
+
+class ArgumentTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='proxy-args-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.binary = build(cls.temp.name, 'proxy')
+
+    def test_unknown_arguments_exit_2(self):
+        for args in (['--bogus'], ['--port', 'abc'], ['--port', '0'], ['70000']):
+            with self.subTest(args=args):
+                result = subprocess.run([self.binary, *args], capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b'usage:', result.stderr)
+
+    def test_bad_token_file_refused_before_listening(self):
+        token = Path(self.temp.name) / 'open-token'
+        token.write_text('0123456789abcdef0123\n')
+        token.chmod(0o644)
+        result = subprocess.run([self.binary, '--auth-file', str(token)], capture_output=True,
+                                timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b'chmod 600', result.stderr)
+        self.assertEqual(result.stdout, b'')
+
+
+class AuthTests(unittest.TestCase):
+    """--auth-file: nothing is resolved or dialed without the token."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='proxy-auth-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.binary = build(cls.temp.name, 'proxy')
+        cls.token_path = Path(cls.temp.name) / 'token'
+
+    def setUp(self):
+        self.proxy = subprocess.Popen([self.binary, '--auth-file', str(self.token_path)],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+        self.addCleanup(self.stop_proxy)
+        self.port = int(self.proxy.stdout.readline())
+        self.token = self.token_path.read_text().strip()
+        self.server = socket.socket()
+        self.addCleanup(self.server.close)
+        self.server.settimeout(3)
+        self.server.bind(('127.0.0.1', 0))
+        self.server.listen()
+        self.target = f'127.0.0.1:{self.server.getsockname()[1]}'
+
+    def stop_proxy(self):
+        self.proxy.terminate()
+        _, errors = self.proxy.communicate(timeout=5)
+        self.assertNotIn(b'ERROR: AddressSanitizer', errors, errors.decode())
+
+    def ask(self, request):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(request)
+            return client.recv(4096)
+
+    def auth(self, userpass):
+        return 'Proxy-Authorization: Basic ' + base64.b64encode(userpass.encode()).decode()
+
+    def assert_not_dialed(self):
+        self.server.settimeout(0.1)
+        with self.assertRaises(TimeoutError):
+            self.server.accept()
+
+    def test_token_file_created_private(self):
+        mode = stat.S_IMODE(self.token_path.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+        self.assertRegex(self.token, r'^[0-9a-f]{32}$')
+
+    def test_missing_credentials_get_407(self):
+        reply = self.ask(f'CONNECT {self.target} HTTP/1.1\r\n\r\n'.encode())
+        self.assertTrue(reply.startswith(b'HTTP/1.1 407 '), reply)
+        self.assertIn(b'Proxy-Authenticate: Basic realm="termux-http-proxy"', reply)
+        self.assert_not_dialed()
+
+    def test_wrong_credentials_get_407(self):
+        for header in (self.auth('proxy:' + self.token[:-1]),
+                       self.auth('proxy:' + self.token + 'x'),
+                       self.auth(self.token + ':'),
+                       'Proxy-Authorization: Bearer ' + self.token):
+            with self.subTest(header=header):
+                reply = self.ask(f'CONNECT {self.target} HTTP/1.1\r\n{header}\r\n\r\n'.encode())
+                self.assertTrue(reply.startswith(b'HTTP/1.1 407 '), reply)
+        self.assert_not_dialed()
+
+    def test_unauthenticated_names_are_not_resolved(self):
+        # A name that would need a lookup still gets 407, not a DNS error: the proxy
+        # cannot be used as a resolver oracle either.
+        reply = self.ask(b'CONNECT no-such-host.invalid:443 HTTP/1.1\r\n\r\n')
+        self.assertTrue(reply.startswith(b'HTTP/1.1 407 '), reply)
+
+    def test_connect_with_token(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(f'CONNECT {self.target} HTTP/1.1\r\n{self.auth("anyone:" + self.token)}\r\n\r\n'.encode())
+            conn, _ = self.server.accept()
+            with conn:
+                self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 200 '))
+                conn.sendall(b'ok')
+                self.assertEqual(client.recv(2), b'ok')
+
+    def test_http_with_token_strips_credentials(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall((f'GET http://{self.target}/ HTTP/1.1\r\nHost: localhost\r\n'
+                            f'{self.auth("p:" + self.token)}\r\n\r\n').encode())
+            conn, _ = self.server.accept()
+            with conn:
+                conn.settimeout(3)
+                expected = b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+                data = b''
+                while len(data) < len(expected):
+                    part = conn.recv(4096)
+                    if not part:
+                        break
+                    data += part
+                self.assertEqual(data, expected)
+
+    @unittest.skipUnless(subprocess.run(['sh', '-c', 'command -v curl'], capture_output=True).returncode == 0,
+                         'curl not installed')
+    def test_curl_with_proxy_url_credentials(self):
+        # What real clients do with HTTPS_PROXY=http://user:token@127.0.0.1:port.
+        with socket.socket() as origin:
+            origin.bind(('127.0.0.1', 0))
+            origin.listen()
+            origin.settimeout(5)
+            port = origin.getsockname()[1]
+            curl = subprocess.Popen(['curl', '-s', '-m', '5', '-p', '-x',
+                                     f'http://proxy:{self.token}@127.0.0.1:{self.port}',
+                                     f'http://127.0.0.1:{port}/'],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            conn, _ = origin.accept()
+            with conn:
+                conn.settimeout(5)
+                request = conn.recv(4096)
+                self.assertTrue(request.startswith(b'GET / HTTP/1.1'), request)
+                conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello')
+            out, _ = curl.communicate(timeout=10)
+            self.assertEqual(out, b'hello')
+
+
+class HeaderTimeoutTests(unittest.TestCase):
+    """Idle clients are dropped in every mode. Before, -f never ran the sweep."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='proxy-timeout-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.binary = build(cls.temp.name, 'proxy', '-DHEADER_TIMEOUT_MS=400')
+
+    def assert_idle_client_dropped(self, port):
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
+            start = time.monotonic()
+            self.assertEqual(client.recv(1), b'')
+            self.assertLess(time.monotonic() - start, 3)
+
+    def test_foreground_daemon_mode(self):
+        port = free_port()
+        proxy = subprocess.Popen([self.binary, '-f', str(port)], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wait_listening(port)
+            self.assert_idle_client_dropped(port)
+            # A partial request line is no better than silence.
+            with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
+                client.sendall(b'CONNECT example.com:443 HTTP/1.1\r\n')
+                self.assertEqual(client.recv(1), b'')
+        finally:
+            proxy.terminate()
+            _, errors = proxy.communicate(timeout=5)
+        self.assertNotIn(b'ERROR: AddressSanitizer', errors, errors.decode())
+
+    def test_coprocess_mode(self):
+        proxy = subprocess.Popen([self.binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        try:
+            self.assert_idle_client_dropped(int(proxy.stdout.readline()))
+        finally:
+            proxy.terminate()
+            _, errors = proxy.communicate(timeout=5)
+        self.assertNotIn(b'ERROR: AddressSanitizer', errors, errors.decode())
+
+
+@unittest.skipUnless(os.environ.get('PROXY_NETWORK_TESTS'), 'set PROXY_NETWORK_TESTS=1')
+class NetworkTests(unittest.TestCase):
+    """Real names through Android's resolver (resNetworkQuery), not the fakes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='proxy-net-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.binary = build(cls.temp.name, 'proxy')
+
+    def setUp(self):
+        self.proxy = subprocess.Popen([self.binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+        self.addCleanup(self.proxy.communicate, timeout=5)
+        self.addCleanup(self.proxy.terminate)
+        self.port = int(self.proxy.stdout.readline())
+
+    def test_connect_resolves_real_name(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=15) as client:
+            client.sendall(b'CONNECT example.com:80 HTTP/1.1\r\n\r\n')
+            self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 200 '))
+            client.sendall(b'HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n')
+            self.assertTrue(client.recv(4096).startswith(b'HTTP/1.'))
+
+    def test_nonexistent_name_is_502(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=15) as client:
+            client.sendall(b'CONNECT no-such-host.invalid:443 HTTP/1.1\r\n\r\n')
+            self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 502 '))
 
 
 if __name__ == '__main__':
