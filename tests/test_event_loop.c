@@ -536,6 +536,88 @@ static void test_socks_udp_dns(void) {
   close(ctl);
 }
 
+// Opens a SOCKS5 UDP association; returns the control socket and fills in the relay.
+static int udp_assoc(struct sockaddr_in *relay) {
+  int ctl = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_in sin = {0};
+  sin.sin_family = AF_INET;
+  sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sin.sin_port = htons((uint16_t)proxy_port);
+  assert(connect(ctl, (struct sockaddr *)&sin, sizeof sin) == 0);
+  static const uint8_t assoc[] = { 5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0 };
+  assert(write(ctl, assoc, sizeof assoc) == sizeof assoc);
+  uint8_t r[12];
+  set_timeout(ctl, 2000);
+  size_t got = 0;
+  while (got < sizeof r) {
+    ssize_t n = read(ctl, r + got, sizeof r - got);
+    assert(n > 0);
+    got += (size_t)n;
+  }
+  assert(r[1] == 0);
+  memset(relay, 0, sizeof *relay);
+  relay->sin_family = AF_INET;
+  memcpy(&relay->sin_addr, r + 6, 4);
+  memcpy(&relay->sin_port, r + 10, 2);
+  return ctl;
+}
+
+static int name_datagram(uint8_t *buf, const char *name, int port, const char *data) {
+  int o = 0;
+  buf[o++] = 0; buf[o++] = 0; buf[o++] = 0; buf[o++] = 3;
+  buf[o++] = (uint8_t)strlen(name);
+  memcpy(buf + o, name, strlen(name));
+  o += (int)strlen(name);
+  o = put16(buf, o, port);
+  memcpy(buf + o, data, strlen(data));
+  return o + (int)strlen(data);
+}
+
+// Datagrams addressed by name (as tun2socks sends with fake-IP DNS): the first is held
+// while the name resolves, then sent (others meanwhile are dropped, as UDP may be);
+// later ones go straight out; replies come back.
+// A name that does not resolve drops its datagrams without harming the association.
+static void test_socks_udp_names(void) {
+  int echo = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_in e = {0};
+  e.sin_family = AF_INET;
+  e.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  assert(bind(echo, (struct sockaddr *)&e, sizeof e) == 0);
+  socklen_t elen = sizeof e;
+  assert(getsockname(echo, (struct sockaddr *)&e, &elen) == 0);
+  set_timeout(echo, 2000);
+
+  struct sockaddr_in relay;
+  int ctl = udp_assoc(&relay);
+  int u = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  assert(connect(u, (struct sockaddr *)&relay, sizeof relay) == 0);
+  set_timeout(u, 2000);
+  uint8_t buf[512];
+  int port = ntohs(e.sin_port);
+  int n = name_datagram(buf, "nx.test", port, "lost");
+  assert(write(u, buf, (size_t)n) == n);
+  n = name_datagram(buf, "fast.test", port, "one");
+  assert(write(u, buf, (size_t)n) == n);
+  n = name_datagram(buf, "fast.test", port, "dropped");
+  assert(write(u, buf, (size_t)n) == n); // Only the first is held while resolving
+  struct sockaddr_in from;
+  socklen_t flen = sizeof from;
+  char got[16] = {0};
+  ssize_t r = recvfrom(echo, got, sizeof got - 1, 0, (struct sockaddr *)&from, &flen);
+  assert(r == 3 && memcmp(got, "one", 3) == 0);
+  // The name is known now: this one goes straight out. "lost" and "dropped" never do.
+  n = name_datagram(buf, "fast.test", port, "two");
+  assert(write(u, buf, (size_t)n) == n);
+  r = recv(echo, got, sizeof got - 1, 0);
+  assert(r == 3 && memcmp(got, "two", 3) == 0);
+  assert(sendto(echo, "back", 4, 0, (struct sockaddr *)&from, flen) == 4);
+  n = (int)read(u, buf, sizeof buf);
+  assert(n == 14 && buf[3] == 1 && memcmp(buf + 10, "back", 4) == 0);
+  close(u);
+  close(ctl);
+  close(echo);
+}
+
 // A client that connects and sends nothing is dropped at HEADER_TIMEOUT_MS.
 static void test_header_timeout(void) {
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -593,6 +675,7 @@ int main(void) {
   test_client_gives_up(lfd, port);
   test_socks(lfd, port);
   test_socks_udp_dns();
+  test_socks_udp_names();
   test_header_timeout();
   test_ipv6_answer();
   close(lfd);

@@ -404,7 +404,7 @@ class ProxyTests(unittest.TestCase):
         ctl, relay, u, echo = self.udp_pair()
         target = echo.getsockname()[1]
         for datagram in (b'\x00\x00\x01' + udp_header('127.0.0.1', target)[3:] + b'fragment',
-                         b'\x00\x00\x00\x03\x09localhost' + target.to_bytes(2, 'big') + b'name',
+                         b'\x00\x00\x00\x03\x00' + target.to_bytes(2, 'big') + b'empty name',
                          udp_header('127.0.0.1', 0) + b'port 0',
                          b'\x00\x00\x00\x01\x7f',
                          b''):
@@ -888,6 +888,19 @@ class DenyTests(unittest.TestCase):
         while 'dns telemetry.blocked.invalid' not in self.log.read_text() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertIn('dns telemetry.blocked.invalid user=- addr=- result=blocked', self.log.read_text())
+
+    def test_denied_udp_name_is_dropped(self):
+        ctl, relay, _ = udp_associate(self.port)
+        with ctl, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            name = b'quic.blocked.invalid'
+            for _ in range(3):
+                u.sendto(b'\x00\x00\x00\x03' + bytes([len(name)]) + name + b'\x01\xbb' + b'hello', relay)
+            time.sleep(0.3)
+        deadline = time.monotonic() + 3
+        while 'socks5-udp quic.blocked.invalid:443' not in self.log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        text = self.log.read_text()
+        self.assertEqual(text.count('socks5-udp quic.blocked.invalid:443 user=- addr=- result=blocked'), 1, text)
 
     def test_other_hosts_pass(self):
         reply = self.ask(f'CONNECT 127.0.0.1:{self.target_port} HTTP/1.1\r\n\r\n'.encode())

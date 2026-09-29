@@ -121,7 +121,7 @@ Clients may send their greeting, credentials and request without waiting for the
 
 ### UDP
 
-`UDP ASSOCIATE` returns a datagram relay on `127.0.0.1`, which lasts as long as the TCP connection that asked for it. Datagrams carry the RFC 1928 header naming their destination, which must be an IP address (as tun2socks-style clients send); fragmented datagrams and domain-name destinations are dropped.
+`UDP ASSOCIATE` returns a datagram relay on `127.0.0.1`, which lasts as long as the TCP connection that asked for it. Datagrams carry the RFC 1928 header naming their destination: an IP address, or a domain name, which is resolved through Android's resolver (IPv4, cached for a minute per association). The first datagram for a name is held until it resolves; others meanwhile are dropped, as UDP allows. Denied names are dropped and logged once. Fragmented datagrams are dropped.
 
 Datagrams to port 53 are DNS: rather than being sent to the server named, they go to Android's resolver (`resNetworkSend`), and the answer comes back as if from that server, with the query's ID. That uses the phone's Private DNS and per-network servers, works where carriers block port 53, and lets the [deny list](#deny-list) answer `NXDOMAIN` for denied names. (Where `resNetworkSend` is unavailable, port 53 is relayed like any other port.)
 
