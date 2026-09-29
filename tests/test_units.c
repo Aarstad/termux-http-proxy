@@ -377,6 +377,50 @@ static void test_deny_list(void) {
   deny_size = 0;
 }
 
+// DNS query names, for the deny list: one question, no compression.
+static void test_query_name(void) {
+  static const uint8_t q[] = { 0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+                               3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+                               3, 'c', 'o', 'm', 0, 0, 1, 0, 1 };
+  char name[256];
+  assert(query_name(q, sizeof q, name, sizeof name) == (int)sizeof q);
+  assert(strcmp(name, "www.example.com") == 0);
+  for (int len = 0; len < (int)sizeof q; len++) assert(query_name(q, len, name, sizeof name) == -1);
+  assert(query_name(q, sizeof q, name, 8) == -1); // Does not fit
+  uint8_t r[sizeof q];
+  memcpy(r, q, sizeof q);
+  r[2] |= 0x80; // A response, not a query
+  assert(query_name(r, sizeof r, name, sizeof name) == -1);
+  memcpy(r, q, sizeof q);
+  r[5] = 2; // Two questions
+  assert(query_name(r, sizeof r, name, sizeof name) == -1);
+  memcpy(r, q, sizeof q);
+  r[12] = 0xC0; // A compression pointer
+  assert(query_name(r, sizeof r, name, sizeof name) == -1);
+}
+
+// SOCKS5 UDP header addresses: IPv4 and IPv6 only, and never read past the end.
+static void test_socks_addr(void) {
+  struct sockaddr_storage ss;
+  static const uint8_t v4[] = { 1, 8, 8, 4, 4, 0, 53 };
+  assert(socks_addr(v4, sizeof v4, &ss) == 7);
+  assert(ss.ss_family == AF_INET && sa_port(&ss) == 53);
+  char text[64];
+  format_addr(text, sizeof text, &ss);
+  assert(strcmp(text, "8.8.4.4:53") == 0);
+  uint8_t v6[19] = { 4 };
+  v6[16] = 1;
+  v6[17] = 0x01;
+  v6[18] = 0xbb;
+  assert(socks_addr(v6, sizeof v6, &ss) == 19 && ss.ss_family == AF_INET6 && sa_port(&ss) == 443);
+  format_addr(text, sizeof text, &ss);
+  assert(strcmp(text, "[::1]:443") == 0);
+  assert(socks_addr(v4, sizeof v4 - 1, &ss) == 0);
+  assert(socks_addr(v6, sizeof v6 - 1, &ss) == 0);
+  static const uint8_t name[] = { 3, 1, 'x', 0, 53 };
+  assert(socks_addr(name, sizeof name, &ss) == 0);
+}
+
 static void test_find_header(void) {
   const char *h = "Host: example.com\r\nPROXY-AUTHORIZATION:   Basic abc\r\nX-Last: tail";
   size_t len = 0;
@@ -447,6 +491,8 @@ int main(void) {
   test_log_copy();
   test_socks_reply();
   test_deny_list();
+  test_query_name();
+  test_socks_addr();
   test_token_file();
   return 0;
 }

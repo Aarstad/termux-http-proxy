@@ -86,6 +86,36 @@ def socks_reply(conn):
     return head[1], recv_exact(conn, size + 2)
 
 
+def udp_header(host, port):
+    for family, atyp in ((socket.AF_INET, 1), (socket.AF_INET6, 4)):
+        try:
+            return bytes([0, 0, 0, atyp]) + socket.inet_pton(family, host) + port.to_bytes(2, 'big')
+        except OSError:
+            pass
+    raise ValueError(host)
+
+
+def dns_query(name, qid=0x1234):
+    labels = b''.join(bytes([len(part)]) + part.encode() for part in name.split('.'))
+    return qid.to_bytes(2, 'big') + b'\x01\x00\x00\x01' + bytes(6) + labels + b'\x00\x00\x01\x00\x01'
+
+
+def udp_associate(port, greeting=b'\x05\x01\x00', client_port=0):
+    """Opens an association; returns (control socket, relay address, method reply)."""
+    ctl = socket.create_connection(('127.0.0.1', port), timeout=3)
+    ctl.sendall(greeting + socks_request('0.0.0.0', client_port, command=3) if client_port
+                else greeting + b'\x05\x03\x00\x01' + bytes(6))
+    method = recv_exact(ctl, 2)
+    if method[1] == 2:
+        method += recv_exact(ctl, 2)
+    code, bound = socks_reply(ctl)
+    assert code == 0, code
+    return ctl, (socket.inet_ntoa(bound[:4]), int.from_bytes(bound[4:], 'big')), method
+
+
+HAS_RES_NSEND = Path('/system/bin/netd').exists() or Path('/apex/com.android.resolv').exists()
+
+
 class ProxyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -279,7 +309,6 @@ class ProxyTests(unittest.TestCase):
         host, port = self.target.split(':')
         cases = {
             'bind': (socks_request(host, int(port), command=2), 7),
-            'udp associate': (socks_request(host, int(port), command=3), 7),
             'address type': (b'\x05\x01\x00\x09' + b'\x00' * 6, 8),
             'empty name': (b'\x05\x01\x00\x03\x00\x01\xbb', 1),
             'nul in name': (b'\x05\x01\x00\x03\x03a\x00b\x01\xbb', 1),
@@ -307,6 +336,101 @@ class ProxyTests(unittest.TestCase):
         with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
             client.sendall(b'\x05\x01\x01')  # GSSAPI only
             self.assertEqual(self.receive(client, 3), b'\x05\xff')
+
+    def udp_pair(self, **kwargs):
+        ctl, relay, _ = udp_associate(self.port, **kwargs)
+        self.addCleanup(ctl.close)
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(u.close)
+        u.settimeout(3)
+        echo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(echo.close)
+        echo.bind(('127.0.0.1', 0))
+        echo.settimeout(3)
+        return ctl, relay, u, echo
+
+    def test_socks_udp_round_trip(self):
+        ctl, relay, u, echo = self.udp_pair()
+        self.assertEqual(relay[0], '127.0.0.1')
+        u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'ping', relay)
+        data, outbound = echo.recvfrom(100)
+        self.assertEqual(data, b'ping')
+        echo.sendto(b'pong', outbound)
+        reply = u.recv(100)
+        self.assertEqual(reply, udp_header('127.0.0.1', echo.getsockname()[1]) + b'pong')
+        # Large datagrams survive intact.
+        big = os.urandom(60000)
+        u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + big, relay)
+        self.assertEqual(echo.recvfrom(65536)[0], big)
+
+    def test_socks_udp_ipv6_destination(self):
+        if not has_ipv6_loopback():
+            self.skipTest('::1 unavailable')
+        ctl, relay, u, _ = self.udp_pair()
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as echo6:
+            echo6.bind(('::1', 0))
+            echo6.settimeout(3)
+            u.sendto(udp_header('::1', echo6.getsockname()[1]) + b'six', relay)
+            data, outbound = echo6.recvfrom(100)
+            echo6.sendto(b'back', outbound)
+            self.assertEqual(u.recv(100), udp_header('::1', echo6.getsockname()[1]) + b'back')
+
+    def test_socks_udp_strangers_are_ignored(self):
+        ctl, relay, u, echo = self.udp_pair()
+        u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'hello', relay)
+        _, outbound = echo.recvfrom(100)
+        u.settimeout(0.3)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stranger:
+            # Only addresses the client has sent to may reply through the outbound socket...
+            stranger.sendto(b'spoof', outbound)
+            with self.assertRaises(TimeoutError):
+                u.recv(100)
+            # ...and only the client may use the relay once it has spoken.
+            stranger.settimeout(0.3)
+            stranger.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'hijack', relay)
+            echo.settimeout(0.3)
+            with self.assertRaises(TimeoutError):
+                echo.recvfrom(100)
+
+    def test_socks_udp_declared_port_is_enforced(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as mine:
+            mine.bind(('127.0.0.1', 0))
+            ctl, relay, u, echo = self.udp_pair(client_port=mine.getsockname()[1])
+            u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'wrong port', relay)
+            mine.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'declared', relay)
+            self.assertEqual(echo.recvfrom(100)[0], b'declared')
+
+    def test_socks_udp_bad_datagrams_are_dropped(self):
+        ctl, relay, u, echo = self.udp_pair()
+        target = echo.getsockname()[1]
+        for datagram in (b'\x00\x00\x01' + udp_header('127.0.0.1', target)[3:] + b'fragment',
+                         b'\x00\x00\x00\x03\x09localhost' + target.to_bytes(2, 'big') + b'name',
+                         udp_header('127.0.0.1', 0) + b'port 0',
+                         b'\x00\x00\x00\x01\x7f',
+                         b''):
+            u.sendto(datagram, relay)
+        u.sendto(udp_header('127.0.0.1', target) + b'good', relay)
+        self.assertEqual(echo.recvfrom(100)[0], b'good')
+
+    def test_socks_udp_ends_with_control_connection(self):
+        ctl, relay, u, echo = self.udp_pair()
+        u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'one', relay)
+        echo.recvfrom(100)
+        ctl.close()
+        time.sleep(0.2)
+        u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'two', relay)
+        echo.settimeout(0.3)
+        with self.assertRaises(TimeoutError):
+            echo.recvfrom(100)
+
+    def test_socks_udp_many_associations(self):
+        # Descriptors are released: more associations than MAX_FDS could hold at once.
+        for _ in range(300):
+            ctl, relay, _ = udp_associate(self.port)
+            ctl.close()
+        ctl, relay, u, echo = self.udp_pair()
+        u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'still fine', relay)
+        self.assertEqual(echo.recvfrom(100)[0], b'still fine')
 
     def test_unit_tests(self):
         self.run_c_test('test_units.c')
@@ -511,6 +635,17 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(recv_exact(client, 5), b'\x05\x02\x01\x01')
         self.assert_not_dialed()
 
+    def test_socks_udp_with_token(self):
+        greeting = b'\x05\x01\x02' + socks_auth('codex', self.token)
+        ctl, relay, method = udp_associate(self.port, greeting=greeting)
+        with ctl, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u, \
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as echo:
+            self.assertEqual(method, b'\x05\x02\x01\x00')
+            echo.bind(('127.0.0.1', 0))
+            echo.settimeout(3)
+            u.sendto(udp_header('127.0.0.1', echo.getsockname()[1]) + b'x', relay)
+            self.assertEqual(echo.recvfrom(10)[0], b'x')
+
     def test_socks_with_token(self):
         host, port = self.target.split(':')
         with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
@@ -638,6 +773,24 @@ class LogTests(unittest.TestCase):
         self.assertNotIn('private', text)
         self.assertNotIn(self.token, text)
 
+    def test_udp_association_line(self):
+        ctl, relay, _ = udp_associate(self.port, greeting=b'\x05\x01\x02' + socks_auth('agy', self.token))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u, \
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as echo:
+            echo.bind(('127.0.0.1', 0))
+            echo.settimeout(3)
+            u.settimeout(3)
+            echo_port = echo.getsockname()[1]
+            u.sendto(udp_header('127.0.0.1', echo_port) + b'x' * 100, relay)
+            _, outbound = echo.recvfrom(1000)
+            echo.sendto(b'y' * 300, outbound)
+            u.recv(1000)
+            ctl.close()
+        line = self.fields(self.lines(1)[0])
+        self.assertEqual((line['proto'], line['target'], line['user'], line['result']),
+                         ('socks5-udp', f'127.0.0.1:{echo_port}', 'agy', 'ok'))
+        self.assertEqual((line['up'], line['down']), ('100', '300'))
+
     def test_stderr_log_has_no_timestamps(self):
         proxy = subprocess.Popen([self.binary, '--log', '-'], stdin=subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -715,6 +868,26 @@ class DenyTests(unittest.TestCase):
             time.sleep(0.02)
         text = self.log.read_text()
         self.assertEqual(text.count('result=blocked'), 4, text)
+
+    @unittest.skipUnless(HAS_RES_NSEND, 'Android resolver unavailable')
+    def test_denied_dns_query_gets_nxdomain(self):
+        ctl, relay, _ = udp_associate(self.port)
+        with ctl, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            u.settimeout(3)
+            query = dns_query('telemetry.blocked.invalid', 0xABCD)
+            u.sendto(udp_header('192.0.2.53', 53) + query, relay)
+            reply = u.recv(1024)
+        self.assertEqual(reply[:10], udp_header('192.0.2.53', 53))
+        answer = reply[10:]
+        self.assertEqual(answer[:2], b'\xab\xcd')
+        self.assertEqual(answer[2] & 0x80, 0x80)  # A response
+        self.assertEqual(answer[3] & 0x0F, 3)     # NXDOMAIN
+        self.assertEqual(answer[4:12], b'\x00\x01' + bytes(6))
+        self.assertEqual(answer[12:], query[12:])  # The question, echoed
+        deadline = time.monotonic() + 3
+        while 'dns telemetry.blocked.invalid' not in self.log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIn('dns telemetry.blocked.invalid user=- addr=- result=blocked', self.log.read_text())
 
     def test_other_hosts_pass(self):
         reply = self.ask(f'CONNECT 127.0.0.1:{self.target_port} HTTP/1.1\r\n\r\n'.encode())
@@ -809,6 +982,17 @@ class NetworkTests(unittest.TestCase):
             self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 200 '))
             client.sendall(b'HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n')
             self.assertTrue(client.recv(4096).startswith(b'HTTP/1.'))
+
+    def test_udp_dns_through_android_resolver(self):
+        ctl, relay, _ = udp_associate(self.port)
+        with ctl, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            u.settimeout(10)
+            u.sendto(udp_header('8.8.8.8', 53) + dns_query('example.com', 0x4242), relay)
+            reply = u.recv(4096)
+        self.assertEqual(reply[:10], udp_header('8.8.8.8', 53))
+        self.assertEqual(reply[10:12], b'\x42\x42')
+        self.assertEqual(reply[13] & 0x0F, 0)
+        self.assertGreater(int.from_bytes(reply[16:18], 'big'), 0)
 
     def test_nonexistent_name_is_502(self):
         with socket.create_connection(('127.0.0.1', self.port), timeout=15) as client:

@@ -20,8 +20,9 @@ On Android:
 * **Zero-copy:** Forwards stream data between sockets entirely in kernel space via `splice(2)` and circular pipes.
 * **Nothing blocks the loop:** Names are resolved with Android's asynchronous resolver, whose answers arrive on file descriptors that `epoll` watches like any socket; A and AAAA are asked in parallel. Upstream connects are non-blocking. One slow lookup or unreachable host no longer stalls every other tunnel.
 * **Per-address connect deadlines:** Each resolved address gets an equal share of the 5s connect budget, so a blackholed IPv6 address cannot eat the time an IPv4 one needs. IPv4 is tried first. Once one of A/AAAA has answered with addresses, the other gets 50ms to catch up (RFC 8305's Resolution Delay) before the proxy dials what it has, so a slow or dropped AAAA query costs 50ms rather than the 10s DNS budget.
-* **HTTP and SOCKS5 on one port:** HTTP `CONNECT`, plain HTTP, and SOCKS5 `CONNECT` with names resolved by the proxy (`socks5h://`). The first byte tells them apart. See [SOCKS5](#socks5).
-* **Optional authentication:** `--auth-file` requires a token before anything is resolved or dialed, over HTTP and SOCKS5 alike (see [Security](#security)).
+* **HTTP and SOCKS5 on one port:** HTTP `CONNECT`, plain HTTP, and SOCKS5 `CONNECT` with names resolved by the proxy (`socks5h://`) and `UDP ASSOCIATE`. The first byte tells them apart. See [SOCKS5](#socks5).
+* **DNS over SOCKS5 UDP through Android's resolver:** datagrams to port 53 are answered by the system resolver, so they get Private DNS and work where raw port-53 traffic is blocked; denied names get `NXDOMAIN`.
+* **Optional authentication:** `--auth-file` requires a token before anything is resolved or dialed, over HTTP and SOCKS5 alike, UDP included (see [Security](#security)).
 * **Deny list:** `--deny-file` refuses listed domains and their subdomains before anything is resolved or dialed; `sv hup` rereads it (see [Deny list](#deny-list)).
 * **Connection log:** `--log` writes a line per connection: where it went, which tool asked, bytes each way, how long, and why it failed if it did (see [Logging](#logging)).
 * **Low memory overhead:** ~3MB RSS / ~700KB PSS, idle or with tunnels open.
@@ -109,7 +110,7 @@ SOCKS5 clients authenticate with username/password (RFC 1929), again with any us
 
 ## SOCKS5
 
-The same port speaks SOCKS5 (RFC 1928). Only the `CONNECT` command is supported: `BIND` and `UDP ASSOCIATE` get reply 7 (command not supported). Targets can be IPv4, IPv6 or a domain name; use `socks5h://` so the proxy resolves names through Android's resolver, which is the reason this proxy exists:
+The same port speaks SOCKS5 (RFC 1928), with the `CONNECT` and `UDP ASSOCIATE` commands; `BIND` gets reply 7 (command not supported). Targets can be IPv4, IPv6 or a domain name; use `socks5h://` so the proxy resolves names through Android's resolver, which is the reason this proxy exists:
 
 ```bash
 curl -x "socks5h://proxy:$TOKEN@127.0.0.1:18080" https://example.com
@@ -118,9 +119,22 @@ export ALL_PROXY="socks5h://proxy:$TOKEN@127.0.0.1:18080"
 
 Clients may send their greeting, credentials and request without waiting for the replies. Failures come back as SOCKS5 reply codes: 4 (host unreachable) for names that do not resolve and for timeouts, 5 for a refused connection, 3 when there is no route to the address family.
 
+### UDP
+
+`UDP ASSOCIATE` returns a datagram relay on `127.0.0.1`, which lasts as long as the TCP connection that asked for it. Datagrams carry the RFC 1928 header naming their destination, which must be an IP address (as tun2socks-style clients send); fragmented datagrams and domain-name destinations are dropped.
+
+Datagrams to port 53 are DNS: rather than being sent to the server named, they go to Android's resolver (`resNetworkSend`), and the answer comes back as if from that server, with the query's ID. That uses the phone's Private DNS and per-network servers, works where carriers block port 53, and lets the [deny list](#deny-list) answer `NXDOMAIN` for denied names. (Where `resNetworkSend` is unavailable, port 53 is relayed like any other port.)
+
+UDP carries no token, and any app can send to loopback, so the relay is locked down:
+
+* It takes datagrams only from the IP address of the connection that authenticated (and from the port the client declared in its request, if it gave one), and after the first one it is `connect()`ed to that sender, so the kernel drops everyone else's.
+* Replies are accepted only from the last 64 addresses the client has sent to.
+
+The association is logged as one `socks5-udp` line when it ends: the first destination and bytes each way. Each DNS query the deny list refuses gets a `dns NAME ... result=blocked` line.
+
 ## Deny list
 
-`--deny-file PATH` refuses connections to the domains listed in `PATH`, and to all their subdomains, before any lookup or connection: HTTP clients get `403 Forbidden`, SOCKS5 clients reply 2 (not allowed by ruleset), and the log says `result=blocked`.
+`--deny-file PATH` refuses connections to the domains listed in `PATH`, and to all their subdomains, before any lookup or connection: HTTP clients get `403 Forbidden`, SOCKS5 clients reply 2 (not allowed by ruleset), DNS queries over SOCKS5 UDP get `NXDOMAIN`, and the log says `result=blocked`.
 
 ```
 # ~/.config/termux-http-proxy/deny
@@ -173,9 +187,9 @@ make test-network    # also resolves real names through Android's resolver
 
 All builds happen in temporary directories under AddressSanitizer (`-fsanitize=address`):
 
-* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, SOCKS5 (pipelined and byte-at-a-time handshakes, every address type, reply codes, unsupported commands), authentication over HTTP and SOCKS5 (including real `curl` with credentials in `http://` and `socks5h://` proxy URLs), the connection log (byte counts, refusals, nothing secret logged), the deny list (HTTP and SOCKS5, no lookup for blocked names, live reload), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
-* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, log sanitising, deny-list matching, SOCKS5 replies, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
-* **`tests/test_event_loop.c`** — runs the real event loop with a fake resolver and a `connect()` that can blackhole chosen addresses: a stalled lookup does not block other clients, NXDOMAIN, a partial A/AAAA answer is dialed after the resolution delay (and an empty one starts no delay), a blackholed address falls through to the next, all-blackholed times out with `504`, IPv4-first ordering, clients hanging up mid-lookup, IPv6 dialing, and SOCKS5 through the same paths.
+* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, SOCKS5 (pipelined and byte-at-a-time handshakes, every address type, reply codes, unsupported commands), authentication over HTTP and SOCKS5 (including real `curl` with credentials in `http://` and `socks5h://` proxy URLs), the connection log (byte counts, refusals, nothing secret logged), SOCKS5 UDP (round trips over IPv4 and IPv6, 60KB datagrams, strangers ignored on both sides, the declared client port, malformed datagrams, teardown with the control connection, descriptors released), the deny list (HTTP, SOCKS5 and DNS `NXDOMAIN`, no lookup for blocked names, live reload), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
+* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, log sanitising, deny-list matching, DNS query and SOCKS5 UDP address parsing, SOCKS5 replies, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
+* **`tests/test_event_loop.c`** — runs the real event loop with a fake resolver and a `connect()` that can blackhole chosen addresses: a stalled lookup does not block other clients, NXDOMAIN, a partial A/AAAA answer is dialed after the resolution delay (and an empty one starts no delay), a blackholed address falls through to the next, all-blackholed times out with `504`, IPv4-first ordering, clients hanging up mid-lookup, IPv6 dialing, SOCKS5 through the same paths, and DNS over SOCKS5 UDP (the answer's ID and source, a stalled query expiring without harming the association).
 * **`tests/measure_memory.py`** — RSS/PSS footprint benchmark, optionally against a Bun implementation (`--bun-js`).
 
 ## Used by

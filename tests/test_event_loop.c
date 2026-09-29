@@ -123,6 +123,36 @@ static void fake_cancel(int fd) {
   close(fd);
 }
 
+// Raw queries (SOCKS5 UDP to port 53): answers "stall.test" never, anything else with
+// one A record, 127.0.0.2, keeping the query's ID and question.
+static int fake_nsend(unsigned netid, const uint8_t *msg, size_t len, uint32_t flags) {
+  (void)netid; (void)flags;
+  int sv[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0);
+  if (len > 17 && memcmp(msg + 13, "stall", 5) == 0) {
+    hold(sv[1]);
+    return sv[0];
+  }
+  uint8_t m[512];
+  assert(len + 16 <= sizeof m);
+  memcpy(m, msg, len);
+  m[2] |= 0x80;
+  m[3] = 0x80;
+  put16(m, 6, 1);
+  int o = (int)len;
+  o = put16(m, o, 0xC00C);
+  o = put16(m, o, NS_T_A);
+  o = put16(m, o, NS_C_IN);
+  o = put16(m, o, 0);
+  o = put16(m, o, 60);
+  o = put16(m, o, 4);
+  memcpy(m + o, "\x7f\x00\x00\x02", 4);
+  o += 4;
+  assert(write(sv[1], m, (size_t)o) == o);
+  close(sv[1]);
+  return sv[0];
+}
+
 // Addresses in 192.0.2.0/24 (TEST-NET-1) and 100::/64 (discard) never finish
 // connecting: the socket is swapped for a Unix socket whose send buffer is full, so
 // EPOLLOUT never fires. Everything else connects for real.
@@ -165,6 +195,7 @@ static void start_proxy(void) {
     res_nquery = fake_nquery;
     res_nresult = fake_nresult;
     res_cancel = fake_cancel;
+    res_nsend = fake_nsend;
     char *argv[] = { "termux-http-proxy", NULL };
     _exit(proxy_main(1, argv));
   }
@@ -430,6 +461,81 @@ static void test_socks(int lfd, int port) {
   close(stuck);
 }
 
+// Builds a single-question A query for name into buf, after a SOCKS5 UDP header for
+// 192.0.2.53:53 (never contacted: port 53 goes to the resolver). Returns the length.
+static int dns_datagram(uint8_t *buf, const char *name, int id) {
+  static const uint8_t head[] = { 0, 0, 0, 1, 192, 0, 2, 53, 0, 53 };
+  memcpy(buf, head, sizeof head);
+  int o = (int)sizeof head;
+  o = put16(buf, o, id);
+  o = put16(buf, o, 0x0100);
+  o = put16(buf, o, 1);
+  memset(buf + o, 0, 6);
+  o += 6;
+  for (const char *p = name; *p;) {
+    const char *dot = strchr(p, '.');
+    int l = dot ? (int)(dot - p) : (int)strlen(p);
+    buf[o++] = (uint8_t)l;
+    memcpy(buf + o, p, (size_t)l);
+    o += l;
+    p += l + (dot ? 1 : 0);
+  }
+  buf[o++] = 0;
+  o = put16(buf, o, NS_T_A);
+  return put16(buf, o, NS_C_IN);
+}
+
+// DNS over SOCKS5 UDP: answered through the resolver with the query's ID, from the
+// address the client sent to. A query that never gets an answer expires without
+// harming the association, and a stalled one does not hold up the next.
+static void test_socks_udp_dns(void) {
+  int ctl = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_in sin = {0};
+  sin.sin_family = AF_INET;
+  sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sin.sin_port = htons((uint16_t)proxy_port);
+  assert(connect(ctl, (struct sockaddr *)&sin, sizeof sin) == 0);
+  static const uint8_t assoc[] = { 5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0 };
+  assert(write(ctl, assoc, sizeof assoc) == sizeof assoc);
+  uint8_t r[12];
+  set_timeout(ctl, 2000);
+  size_t got = 0;
+  while (got < sizeof r) {
+    ssize_t n = read(ctl, r + got, sizeof r - got);
+    assert(n > 0);
+    got += (size_t)n;
+  }
+  assert(r[0] == 5 && r[1] == 0 && r[3] == 0 && r[5] == 1);
+  struct sockaddr_in relay = {0};
+  relay.sin_family = AF_INET;
+  memcpy(&relay.sin_addr, r + 6, 4);
+  memcpy(&relay.sin_port, r + 10, 2);
+
+  int u = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  assert(connect(u, (struct sockaddr *)&relay, sizeof relay) == 0);
+  set_timeout(u, 2000);
+  uint8_t buf[512];
+  int n = dns_datagram(buf, "stall.test", 0x0101);
+  assert(write(u, buf, (size_t)n) == n);
+  n = dns_datagram(buf, "fast.test", 0xBEEF);
+  int64_t t0 = monotonic_ms();
+  assert(write(u, buf, (size_t)n) == n);
+  n = (int)read(u, buf, sizeof buf);
+  assert(since(t0) < 200);
+  // Header from 192.0.2.53:53, then the answer: same ID, one record, 127.0.0.2.
+  assert(n > 10 + 12 && memcmp(buf, "\0\0\0\x01\xc0\x00\x02\x35\x00\x35", 10) == 0);
+  assert(buf[10] == 0xBE && buf[11] == 0xEF && (buf[12] & 0x80) && buf[17] == 1);
+  assert(memcmp(buf + n - 4, "\x7f\x00\x00\x02", 4) == 0);
+  // The stalled query expires at DNS_TIMEOUT_MS, silently; the association carries on.
+  usleep((DNS_TIMEOUT_MS + 200) * 1000);
+  n = dns_datagram(buf, "again.test", 0x0202);
+  assert(write(u, buf, (size_t)n) == n);
+  n = (int)read(u, buf, sizeof buf);
+  assert(n > 22 && buf[10] == 0x02 && buf[11] == 0x02);
+  close(u);
+  close(ctl);
+}
+
 // A client that connects and sends nothing is dropped at HEADER_TIMEOUT_MS.
 static void test_header_timeout(void) {
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -486,6 +592,7 @@ int main(void) {
   test_ipv4_first(lfd, port);
   test_client_gives_up(lfd, port);
   test_socks(lfd, port);
+  test_socks_udp_dns();
   test_header_timeout();
   test_ipv6_answer();
   close(lfd);
