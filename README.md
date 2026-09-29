@@ -22,6 +22,7 @@ On Android:
 * **Per-address connect deadlines:** Each resolved address gets an equal share of the 5s connect budget, so a blackholed IPv6 address cannot eat the time an IPv4 one needs. IPv4 is tried first. Once one of A/AAAA has answered with addresses, the other gets 50ms to catch up (RFC 8305's Resolution Delay) before the proxy dials what it has, so a slow or dropped AAAA query costs 50ms rather than the 10s DNS budget.
 * **HTTP and SOCKS5 on one port:** HTTP `CONNECT`, plain HTTP, and SOCKS5 `CONNECT` with names resolved by the proxy (`socks5h://`). The first byte tells them apart. See [SOCKS5](#socks5).
 * **Optional authentication:** `--auth-file` requires a token before anything is resolved or dialed, over HTTP and SOCKS5 alike (see [Security](#security)).
+* **Deny list:** `--deny-file` refuses listed domains and their subdomains before anything is resolved or dialed; `sv hup` rereads it (see [Deny list](#deny-list)).
 * **Connection log:** `--log` writes a line per connection: where it went, which tool asked, bytes each way, how long, and why it failed if it did (see [Logging](#logging)).
 * **Low memory overhead:** ~3MB RSS / ~700KB PSS, idle or with tunnels open.
 * **0% idle CPU:** Single-threaded event loop driven by `epoll(7)`. With no connection mid-setup, it sleeps with an infinite timeout; deadlines only wake it while something is pending.
@@ -41,6 +42,7 @@ This installs `termux-http-proxy` and `termux-http-proxy-ctl` into `$PREFIX/bin`
 
 ```
 termux-http-proxy [--port PORT | PORT] [-f | -d] [--auth-file PATH] [--log PATH]
+                  [--deny-file PATH]
 ```
 
 ### Run as a background helper (coprocess mode)
@@ -116,6 +118,20 @@ export ALL_PROXY="socks5h://proxy:$TOKEN@127.0.0.1:18080"
 
 Clients may send their greeting, credentials and request without waiting for the replies. Failures come back as SOCKS5 reply codes: 4 (host unreachable) for names that do not resolve and for timeouts, 5 for a refused connection, 3 when there is no route to the address family.
 
+## Deny list
+
+`--deny-file PATH` refuses connections to the domains listed in `PATH`, and to all their subdomains, before any lookup or connection: HTTP clients get `403 Forbidden`, SOCKS5 clients reply 2 (not allowed by ruleset), and the log says `result=blocked`.
+
+```
+# ~/.config/termux-http-proxy/deny
+datadoghq.com        # also blocks http-intake.logs.us5.datadoghq.com
+*.example.net        # "*." and a leading "." are optional
+```
+
+One domain per line; `#` starts a comment; matching ignores case and a trailing dot. `SIGHUP` rereads the file (`sv hup termux-http-proxy` under runit), and a file that has become unreadable leaves the previous list in force; at startup a missing file is an error.
+
+It matches the name a client asks for. A client that connects to an IP address directly, or uses its own DNS-over-HTTPS, is not caught by a domain rule.
+
 ## Logging
 
 `--log PATH` appends a line per connection to `PATH` (created with mode `0600`), written when the connection ends:
@@ -157,8 +173,8 @@ make test-network    # also resolves real names through Android's resolver
 
 All builds happen in temporary directories under AddressSanitizer (`-fsanitize=address`):
 
-* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, SOCKS5 (pipelined and byte-at-a-time handshakes, every address type, reply codes, unsupported commands), authentication over HTTP and SOCKS5 (including real `curl` with credentials in `http://` and `socks5h://` proxy URLs), the connection log (byte counts, refusals, nothing secret logged), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
-* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, log sanitising, SOCKS5 replies, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
+* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, SOCKS5 (pipelined and byte-at-a-time handshakes, every address type, reply codes, unsupported commands), authentication over HTTP and SOCKS5 (including real `curl` with credentials in `http://` and `socks5h://` proxy URLs), the connection log (byte counts, refusals, nothing secret logged), the deny list (HTTP and SOCKS5, no lookup for blocked names, live reload), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
+* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, log sanitising, deny-list matching, SOCKS5 replies, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
 * **`tests/test_event_loop.c`** — runs the real event loop with a fake resolver and a `connect()` that can blackhole chosen addresses: a stalled lookup does not block other clients, NXDOMAIN, a partial A/AAAA answer is dialed after the resolution delay (and an empty one starts no delay), a blackholed address falls through to the next, all-blackholed times out with `504`, IPv4-first ordering, clients hanging up mid-lookup, IPv6 dialing, and SOCKS5 through the same paths.
 * **`tests/measure_memory.py`** — RSS/PSS footprint benchmark, optionally against a Bun implementation (`--bun-js`).
 

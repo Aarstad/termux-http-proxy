@@ -350,6 +350,33 @@ static void test_socks_reply(void) {
   close(fd);
 }
 
+// Listed domains match themselves and their subdomains, and nothing else.
+static void test_deny_list(void) {
+  char path[] = "/data/data/com.termux/files/usr/tmp/deny-XXXXXX";
+  int fd = mkstemp(path);
+  assert(fd >= 0);
+  const char *text = "# telemetry\n  DataDogHQ.com  # trailing comment\n*.wild.test\n.dot.test.\n\n  \n";
+  assert(write(fd, text, strlen(text)) == (ssize_t)strlen(text));
+  close(fd);
+  assert(load_deny(path) == 3);
+  assert(host_denied("datadoghq.com"));
+  assert(host_denied("http-intake.logs.us5.datadoghq.com"));
+  assert(host_denied("HTTP-Intake.DATADOGHQ.com."));
+  assert(host_denied("wild.test") && host_denied("a.wild.test"));
+  assert(host_denied("dot.test") && host_denied("x.dot.test"));
+  assert(!host_denied("notdatadoghq.com"));
+  assert(!host_denied("datadoghq.com.evil"));
+  assert(!host_denied("com"));
+  assert(!host_denied("anthropic.com"));
+  // An unreadable file keeps the list in force.
+  unlink(path);
+  assert(load_deny(path) == -1);
+  assert(host_denied("datadoghq.com"));
+  free(deny_list);
+  deny_list = NULL;
+  deny_size = 0;
+}
+
 static void test_find_header(void) {
   const char *h = "Host: example.com\r\nPROXY-AUTHORIZATION:   Basic abc\r\nX-Last: tail";
   size_t len = 0;
@@ -419,6 +446,7 @@ int main(void) {
   test_find_header();
   test_log_copy();
   test_socks_reply();
+  test_deny_list();
   test_token_file();
   return 0;
 }

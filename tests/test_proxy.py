@@ -6,6 +6,7 @@ PROXY_NETWORK_TESTS=1 also runs tests that resolve real names over the network.
 """
 import base64
 import os
+import signal
 import concurrent.futures
 import time
 from pathlib import Path
@@ -654,6 +655,93 @@ class LogTests(unittest.TestCase):
                                 capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 2)
         self.assertIn(b'needs -f', result.stderr)
+
+
+class DenyTests(unittest.TestCase):
+    """--deny-file: listed domains are refused before anything is resolved or dialed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='proxy-deny-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.binary = build(cls.temp.name, 'proxy')
+
+    def setUp(self):
+        self.deny = Path(self.temp.name) / 'deny'
+        self.deny.write_text('# test list\nlocalhost\nblocked.invalid\n')
+        self.log = Path(self.temp.name) / f'{self._testMethodName}.log'
+        self.proxy = subprocess.Popen([self.binary, '--deny-file', str(self.deny), '--log', str(self.log)],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+        self.addCleanup(self.stop_proxy)
+        self.port = int(self.proxy.stdout.readline())
+        self.server = socket.socket()
+        self.addCleanup(self.server.close)
+        self.server.settimeout(3)
+        self.server.bind(('127.0.0.1', 0))
+        self.server.listen()
+        self.target_port = self.server.getsockname()[1]
+
+    def stop_proxy(self):
+        self.proxy.terminate()
+        _, self.errors = self.proxy.communicate(timeout=5)
+        self.assertNotIn(b'ERROR: AddressSanitizer', self.errors, self.errors.decode())
+
+    def ask(self, request):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(request)
+            return client.recv(4096)
+
+    def assert_not_dialed(self):
+        self.server.settimeout(0.1)
+        with self.assertRaises(TimeoutError):
+            self.server.accept()
+
+    def test_blocked_over_http_and_socks(self):
+        reply = self.ask(f'CONNECT localhost:{self.target_port} HTTP/1.1\r\n\r\n'.encode())
+        self.assertTrue(reply.startswith(b'HTTP/1.1 403 '), reply)
+        reply = self.ask(f'GET http://LOCALHOST.:{self.target_port}/ HTTP/1.1\r\n\r\n'.encode())
+        self.assertTrue(reply.startswith(b'HTTP/1.1 403 '), reply)
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'\x05\x01\x00' + socks_request('localhost', self.target_port))
+            self.assertEqual(recv_exact(client, 4), b'\x05\x00\x05\x02')  # 2: not allowed by ruleset
+        self.assert_not_dialed()
+        # Blocked names are not looked up either.
+        reply = self.ask(b'CONNECT sub.blocked.invalid:443 HTTP/1.1\r\n\r\n')
+        self.assertTrue(reply.startswith(b'HTTP/1.1 403 '), reply)
+        # The line is written as the connection closes, just after the reply.
+        deadline = time.monotonic() + 3
+        while self.log.read_text().count('result=blocked') < 4 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        text = self.log.read_text()
+        self.assertEqual(text.count('result=blocked'), 4, text)
+
+    def test_other_hosts_pass(self):
+        reply = self.ask(f'CONNECT 127.0.0.1:{self.target_port} HTTP/1.1\r\n\r\n'.encode())
+        self.assertTrue(reply.startswith(b'HTTP/1.1 200 '), reply)
+
+    def test_sighup_rereads_the_list(self):
+        self.deny.write_text('blocked.invalid\n')
+        self.proxy.send_signal(signal.SIGHUP)
+        time.sleep(0.3)
+        reply = self.ask(f'CONNECT localhost:{self.target_port} HTTP/1.1\r\n\r\n'.encode())
+        self.assertTrue(reply.startswith(b'HTTP/1.1 200 '), reply)
+        # A list that has become unreadable leaves the last one in force.
+        self.deny.unlink()
+        self.proxy.send_signal(signal.SIGHUP)
+        time.sleep(0.3)
+        reply = self.ask(b'CONNECT blocked.invalid:443 HTTP/1.1\r\n\r\n')
+        self.assertTrue(reply.startswith(b'HTTP/1.1 403 '), reply)
+        self.assertEqual(self.proxy.poll(), None)
+        self.stop_proxy()
+        self.assertIn(b'reread', self.errors)
+        self.assertIn(b'cannot open', self.errors)
+
+    def test_missing_deny_file_refused_at_start(self):
+        result = subprocess.run([self.binary, '--deny-file', str(Path(self.temp.name) / 'nope')],
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b'cannot open', result.stderr)
 
 
 class HeaderTimeoutTests(unittest.TestCase):
