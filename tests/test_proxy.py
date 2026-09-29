@@ -52,6 +52,39 @@ def has_ipv6_loopback():
         return False
 
 
+def socks_request(host, port, command=1):
+    """A SOCKS5 request for an IPv4/IPv6 literal or a domain name."""
+    for family, atyp in ((socket.AF_INET, 1), (socket.AF_INET6, 4)):
+        try:
+            return bytes([5, command, 0, atyp]) + socket.inet_pton(family, host) + port.to_bytes(2, 'big')
+        except OSError:
+            pass
+    return bytes([5, command, 0, 3, len(host)]) + host.encode() + port.to_bytes(2, 'big')
+
+
+def socks_auth(user, password):
+    return bytes([1, len(user)]) + user.encode() + bytes([len(password)]) + password.encode()
+
+
+def recv_exact(conn, length):
+    data = b''
+    while len(data) < length:
+        part = conn.recv(length - len(data))
+        if not part:
+            break
+        data += part
+    return data
+
+
+def socks_reply(conn):
+    """Reads a SOCKS5 reply; returns (code, bound address bytes)."""
+    head = recv_exact(conn, 4)
+    if len(head) < 4:
+        return None, b''
+    size = {1: 4, 4: 16}.get(head[3], 0)
+    return head[1], recv_exact(conn, size + 2)
+
+
 class ProxyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -192,6 +225,87 @@ class ProxyTests(unittest.TestCase):
                 with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
                     client.sendall(f'CONNECT {target} HTTP/1.1\r\n\r\n'.encode())
                     self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 400 '))
+
+    def test_socks_ipv4_with_early_payload(self):
+        # Greeting, request and first payload bytes in one write, as optimistic clients send.
+        host, port = self.target.split(':')
+        self.client.sendall(b'\x05\x01\x00' + socks_request(host, int(port)) + b'early')
+        conn = self.upstream()
+        self.assertEqual(self.receive(conn, 5), b'early')
+        self.assertEqual(self.receive(self.client, 2), b'\x05\x00')
+        code, bound = socks_reply(self.client)
+        self.assertEqual(code, 0)
+        self.assertEqual(bound[:4], socket.inet_aton('127.0.0.1'))
+        conn.sendall(b'pong')
+        self.assertEqual(self.receive(self.client, 4), b'pong')
+
+    def test_socks_one_byte_at_a_time(self):
+        port = int(self.target.split(':')[1])
+        for message, reply_len in ((b'\x05\x02\x00\x02', 2), (socks_request('localhost', port), None)):
+            for byte in message:
+                self.client.send(bytes([byte]))
+                time.sleep(0.005)
+            if reply_len:
+                self.assertEqual(self.receive(self.client, reply_len), b'\x05\x00')
+        conn = self.upstream()
+        self.assertEqual(socks_reply(self.client)[0], 0)
+        self.client.sendall(b'ping')
+        self.assertEqual(self.receive(conn, 4), b'ping')
+
+    def test_socks_bracketless_ipv6_literal(self):
+        if not has_ipv6_loopback():
+            self.skipTest('::1 unavailable')
+        with socket.socket(socket.AF_INET6) as server6:
+            server6.bind(('::1', 0))
+            server6.listen()
+            server6.settimeout(3)
+            self.client.sendall(b'\x05\x01\x00' + socks_request('::1', server6.getsockname()[1]))
+            conn, _ = server6.accept()
+            conn.close()
+            self.assertEqual(self.receive(self.client, 2), b'\x05\x00')
+            code, bound = socks_reply(self.client)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(bound), 18)
+
+    def test_socks_refused_is_code_5(self):
+        host, port = self.target.split(':')
+        self.server.close()
+        self.client.sendall(b'\x05\x01\x00' + socks_request(host, int(port)))
+        self.assertEqual(self.receive(self.client, 2), b'\x05\x00')
+        self.assertEqual(socks_reply(self.client)[0], 5)
+
+    def test_socks_unsupported_requests_rejected_before_dial(self):
+        host, port = self.target.split(':')
+        cases = {
+            'bind': (socks_request(host, int(port), command=2), 7),
+            'udp associate': (socks_request(host, int(port), command=3), 7),
+            'address type': (b'\x05\x01\x00\x09' + b'\x00' * 6, 8),
+            'empty name': (b'\x05\x01\x00\x03\x00\x01\xbb', 1),
+            'nul in name': (b'\x05\x01\x00\x03\x03a\x00b\x01\xbb', 1),
+            'port 0': (socks_request(host, 0), 1),
+        }
+        for name, (request, code) in cases.items():
+            with self.subTest(name=name):
+                with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+                    client.sendall(b'\x05\x01\x00' + request)
+                    self.assertEqual(self.receive(client, 2), b'\x05\x00')
+                    self.assertEqual(socks_reply(client)[0], code)
+                    self.assertEqual(client.recv(1), b'')
+        self.server.settimeout(0.1)
+        with self.assertRaises(TimeoutError):
+            self.server.accept()
+
+    def test_socks_methods_without_a_token(self):
+        # Credentials a client insists on are accepted and ignored; a client that
+        # offers no method we support is turned away.
+        host, port = self.target.split(':')
+        self.client.sendall(b'\x05\x01\x02' + socks_auth('me', 'anything') + socks_request(host, int(port)))
+        self.assertEqual(self.receive(self.client, 4), b'\x05\x02\x01\x00')
+        self.upstream()
+        self.assertEqual(socks_reply(self.client)[0], 0)
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'\x05\x01\x01')  # GSSAPI only
+            self.assertEqual(self.receive(client, 3), b'\x05\xff')
 
     def test_unit_tests(self):
         self.run_c_test('test_units.c')
@@ -373,6 +487,173 @@ class AuthTests(unittest.TestCase):
                 conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello')
             out, _ = curl.communicate(timeout=10)
             self.assertEqual(out, b'hello')
+
+
+    def test_socks_requires_the_password_method(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'\x05\x01\x00' + socks_request('127.0.0.1', 1))
+            self.assertEqual(recv_exact(client, 3), b'\x05\xff')
+        self.assert_not_dialed()
+
+    def test_socks_wrong_password(self):
+        host, port = self.target.split(':')
+        for password in (self.token[:-1], self.token + 'x', ''):
+            with self.subTest(password=password):
+                with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+                    client.sendall(b'\x05\x01\x02' + socks_auth('proxy', password)
+                                   + socks_request(host, int(port)))
+                    self.assertEqual(recv_exact(client, 5), b'\x05\x02\x01\x01')
+        # Nor is a name looked up for a client with the wrong password.
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'\x05\x01\x02' + socks_auth('p', 'wrong-token-here')
+                           + socks_request('no-such-host.invalid', 443))
+            self.assertEqual(recv_exact(client, 5), b'\x05\x02\x01\x01')
+        self.assert_not_dialed()
+
+    def test_socks_with_token(self):
+        host, port = self.target.split(':')
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'\x05\x02\x00\x02' + socks_auth('anyone', self.token)
+                           + socks_request(host, int(port)))
+            conn, _ = self.server.accept()
+            with conn:
+                self.assertEqual(recv_exact(client, 4), b'\x05\x02\x01\x00')
+                self.assertEqual(socks_reply(client)[0], 0)
+                conn.sendall(b'ok')
+                self.assertEqual(client.recv(2), b'ok')
+
+    @unittest.skipUnless(subprocess.run(['sh', '-c', 'command -v curl'], capture_output=True).returncode == 0,
+                         'curl not installed')
+    def test_curl_socks5h_with_credentials(self):
+        with socket.socket() as origin:
+            origin.bind(('127.0.0.1', 0))
+            origin.listen()
+            origin.settimeout(5)
+            port = origin.getsockname()[1]
+            curl = subprocess.Popen(['curl', '-s', '-m', '5', '-x',
+                                     f'socks5h://proxy:{self.token}@127.0.0.1:{self.port}',
+                                     f'http://localhost:{port}/'],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            conn, _ = origin.accept()
+            with conn:
+                conn.settimeout(5)
+                self.assertTrue(conn.recv(4096).startswith(b'GET / HTTP/1.1'))
+                conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello')
+            out, _ = curl.communicate(timeout=10)
+            self.assertEqual(out, b'hello')
+
+
+class LogTests(unittest.TestCase):
+    """--log: a line per connection, written when it ends."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='proxy-log-')
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.binary = build(cls.temp.name, 'proxy')
+        cls.token_path = Path(cls.temp.name) / 'token'
+
+    def setUp(self):
+        self.log = Path(self.temp.name) / f'{self._testMethodName}.log'
+        self.proxy = subprocess.Popen([self.binary, '--auth-file', str(self.token_path),
+                                       '--log', str(self.log)],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+        self.addCleanup(self.stop_proxy)
+        self.port = int(self.proxy.stdout.readline())
+        self.token = self.token_path.read_text().strip()
+        self.server = socket.socket()
+        self.addCleanup(self.server.close)
+        self.server.settimeout(3)
+        self.server.bind(('127.0.0.1', 0))
+        self.server.listen()
+        self.target_port = self.server.getsockname()[1]
+
+    def stop_proxy(self):
+        self.proxy.terminate()
+        _, errors = self.proxy.communicate(timeout=5)
+        self.assertNotIn(b'ERROR: AddressSanitizer', errors, errors.decode())
+
+    def lines(self, count):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            lines = self.log.read_text().splitlines() if self.log.exists() else []
+            if len(lines) >= count:
+                return lines
+            time.sleep(0.02)
+        self.fail(f'expected {count} log lines, got: {lines}')
+
+    def fields(self, line):
+        # "YYYY-MM-DD HH:MM:SS proto target key=value..."
+        date, clock, proto, target, *rest = line.split(' ')
+        self.assertRegex(f'{date} {clock}', r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$')
+        return dict(proto=proto, target=target, **dict(kv.split('=', 1) for kv in rest))
+
+    def test_tunnel_line_counts_bytes_both_ways(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'\x05\x01\x02' + socks_auth('claude', self.token)
+                           + socks_request('localhost', self.target_port) + b'x' * 1000)
+            conn, _ = self.server.accept()
+            recv_exact(client, 4)
+            socks_reply(client)
+            conn.sendall(b'y' * 3000)
+            recv_exact(client, 3000)
+            self.assertEqual(len(recv_exact(conn, 1000)), 1000)
+            conn.close()
+        line = self.fields(self.lines(1)[0])
+        self.assertEqual(line['proto'], 'socks5')
+        self.assertEqual(line['target'], f'localhost:{self.target_port}')
+        self.assertEqual(line['user'], 'claude')
+        self.assertIn(line['addr'], ('127.0.0.1', '::1'))
+        self.assertEqual(line['result'], 'ok')
+        self.assertEqual((line['up'], line['down']), ('1000', '3000'))
+        self.assertRegex(line['time'], r'^\d+\.\d{3}s$')
+        self.assertEqual(stat.S_IMODE(self.log.stat().st_mode), 0o600)
+
+    def test_refusals_are_logged_without_secrets(self):
+        auth = base64.b64encode(f'agy:{self.token}'.encode()).decode()
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'CONNECT evil.test:443 HTTP/1.1\r\n\r\n')
+            client.recv(4096)
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall(b'\x05\x01\x02' + socks_auth('bad user', 'wrong-token-here'))
+            recv_exact(client, 4)
+        with socket.create_connection(('127.0.0.1', self.port), timeout=3) as client:
+            client.sendall((f'GET http://127.0.0.1:{self.target_port}/private?key=hunter2 HTTP/1.1\r\n'
+                            f'Proxy-Authorization: Basic {auth}\r\n\r\n').encode())
+            conn, _ = self.server.accept()
+            conn.close()
+            client.recv(4096)
+        lines = self.lines(3)
+        refused, bad_password, http = (self.fields(line) for line in lines)
+        self.assertEqual((refused['proto'], refused['target'], refused['result']),
+                         ('connect', 'evil.test:443', 'auth-failed'))
+        self.assertEqual((bad_password['proto'], bad_password['user'], bad_password['result']),
+                         ('socks5', 'bad?user', 'auth-failed'))
+        self.assertEqual((http['proto'], http['target'], http['user']),
+                         ('http', f'127.0.0.1:{self.target_port}', 'agy'))
+        text = self.log.read_text()
+        self.assertNotIn('hunter2', text)
+        self.assertNotIn('private', text)
+        self.assertNotIn(self.token, text)
+
+    def test_stderr_log_has_no_timestamps(self):
+        proxy = subprocess.Popen([self.binary, '--log', '-'], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        port = int(proxy.stdout.readline())
+        with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
+            client.sendall(b'CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n')
+            client.recv(4096)
+        time.sleep(0.2)
+        proxy.terminate()
+        _, errors = proxy.communicate(timeout=5)
+        self.assertTrue(errors.startswith(b'connect 127.0.0.1:1 user=- addr=- result=refused '), errors)
+
+    def test_stderr_log_needs_foreground(self):
+        result = subprocess.run([self.binary, '--port', str(free_port()), '--log', '-'],
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b'needs -f', result.stderr)
 
 
 class HeaderTimeoutTests(unittest.TestCase):

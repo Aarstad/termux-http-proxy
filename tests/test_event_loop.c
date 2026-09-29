@@ -250,6 +250,41 @@ static int status(int fd, int timeout_ms) {
   return code;
 }
 
+// Connects and sends a SOCKS5 greeting (no authentication) and a CONNECT request for
+// host:port in one write, as optimistic clients do.
+static int socks_request_to(const char *host, int port) {
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  assert(fd >= 0);
+  struct sockaddr_in sin = {0};
+  sin.sin_family = AF_INET;
+  sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sin.sin_port = htons((uint16_t)proxy_port);
+  assert(connect(fd, (struct sockaddr *)&sin, sizeof sin) == 0);
+  uint8_t buf[300] = { 5, 1, 0, 5, 1, 0, 3 };
+  size_t hl = strlen(host), n = 7;
+  buf[n++] = (uint8_t)hl;
+  memcpy(buf + n, host, hl);
+  n += hl;
+  buf[n++] = (uint8_t)(port >> 8);
+  buf[n++] = (uint8_t)port;
+  assert(write(fd, buf, n) == (ssize_t)n);
+  return fd;
+}
+
+// Reads the method selection and the reply; returns the reply code (-1 on timeout).
+static int socks_status(int fd, int timeout_ms) {
+  set_timeout(fd, timeout_ms);
+  uint8_t buf[12];
+  size_t n = 0;
+  while (n < sizeof buf) {
+    ssize_t r = read(fd, buf + n, sizeof buf - n);
+    if (r <= 0) break;
+    n += (size_t)r;
+  }
+  if (n < 12 || buf[0] != 5 || buf[1] != 0 || buf[2] != 5) return -1;
+  return buf[3];
+}
+
 // The tunnel carries bytes in both directions.
 static void check_tunnel(int client, int lfd) {
   set_timeout(lfd, 2000);
@@ -364,6 +399,37 @@ static void test_client_gives_up(int lfd, int port) {
   close(fd);
 }
 
+// SOCKS5 goes through the same resolve and dial path, with failures reported as
+// SOCKS5 reply codes: 4 (host unreachable) for a missing name and for timeouts.
+static void test_socks(int lfd, int port) {
+  int fd = socks_request_to("fast.test", port);
+  assert(socks_status(fd, 2000) == 0);
+  check_tunnel(fd, lfd);
+  close(fd);
+
+  int64_t t0 = monotonic_ms();
+  fd = socks_request_to("nx.test", port);
+  assert(socks_status(fd, 2000) == 4);
+  assert(since(t0) < 200);
+  close(fd);
+
+  t0 = monotonic_ms();
+  fd = socks_request_to("all-blackhole.test", port);
+  assert(socks_status(fd, 3000) == 4);
+  assert(since(t0) >= CONNECT_TIMEOUT_MS - 50);
+  close(fd);
+
+  // A stalled lookup holds up neither HTTP nor SOCKS5 clients.
+  int stuck = socks_request_to("slow.test", port);
+  usleep(50000);
+  fd = request("fast.test", port);
+  assert(status(fd, 2000) == 200);
+  check_tunnel(fd, lfd);
+  close(fd);
+  assert(socks_status(stuck, 3000) == 4);
+  close(stuck);
+}
+
 // A client that connects and sends nothing is dropped at HEADER_TIMEOUT_MS.
 static void test_header_timeout(void) {
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -419,6 +485,7 @@ int main(void) {
   test_all_blackholed_times_out(port);
   test_ipv4_first(lfd, port);
   test_client_gives_up(lfd, port);
+  test_socks(lfd, port);
   test_header_timeout();
   test_ipv6_answer();
   close(lfd);

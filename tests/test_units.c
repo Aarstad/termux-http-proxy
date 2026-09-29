@@ -291,7 +291,7 @@ static int basic(const char *userpass, const char *scheme) {
   char enc[512], value[600];
   b64(userpass, enc);
   snprintf(value, sizeof value, "%s%s", scheme, enc);
-  return credentials_ok(value, strlen(value));
+  return credentials_ok(value, strlen(value), NULL, 0);
 }
 
 static void test_credentials(void) {
@@ -307,15 +307,47 @@ static void test_credentials(void) {
   assert(!basic("0123456789abcdef0123:", "Basic "));       // Token as the username
   assert(!basic("u:0123456789abcdef0123:x", "Basic "));    // Colon belongs to the password
   assert(!basic("proxy:0123456789abcdef0123", "Bearer "));
-  assert(!credentials_ok("Basic !!!!", 10));
-  assert(!credentials_ok("Basic", 5));
+  assert(!credentials_ok("Basic !!!!", 10, NULL, 0));
+  assert(!credentials_ok("Basic", 5, NULL, 0));
   // Trailing whitespace and a stray CR are tolerated.
   char enc[256], value[300];
   b64("p:0123456789abcdef0123", enc);
   snprintf(value, sizeof value, "Basic %s \r", enc);
-  assert(credentials_ok(value, strlen(value)));
+  assert(credentials_ok(value, strlen(value), NULL, 0));
+  // The username is kept for the log, sanitised and truncated, right token or not.
+  char user[8];
+  b64("clau de\x01xyz:wrong", enc);
+  snprintf(value, sizeof value, "Basic %s", enc);
+  assert(!credentials_ok(value, strlen(value), user, sizeof user));
+  assert(strcmp(user, "clau?de") == 0);
   auth_len = 0;
   auth_token[0] = 0;
+}
+
+// Client-supplied text cannot break a log line into more fields or lines.
+static void test_log_copy(void) {
+  char out[16];
+  log_copy(out, sizeof out, "a b\nc\td\x7f\xff", 9);
+  assert(strcmp(out, "a?b?c?d??") == 0);
+  log_copy(out, 4, "abcdef", 6);
+  assert(strcmp(out, "abc") == 0);
+}
+
+// SOCKS5 replies carry the upstream socket's local address, or 0.0.0.0:0.
+static void test_socks_reply(void) {
+  uint8_t buf[22];
+  assert(socks_reply(buf, 4, -1) == 10);
+  assert(memcmp(buf, "\x05\x04\x00\x01\0\0\0\0\0\0", 10) == 0);
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in sin = { .sin_family = AF_INET };
+  sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t len = sizeof sin;
+  assert(bind(fd, (struct sockaddr *)&sin, sizeof sin) == 0);
+  assert(getsockname(fd, (struct sockaddr *)&sin, &len) == 0);
+  assert(socks_reply(buf, 0, fd) == 10);
+  assert(memcmp(buf, "\x05\x00\x00\x01\x7f\x00\x00\x01", 8) == 0);
+  assert(memcmp(buf + 8, &sin.sin_port, 2) == 0);
+  close(fd);
 }
 
 static void test_find_header(void) {
@@ -385,6 +417,8 @@ int main(void) {
   test_split_host_port();
   test_credentials();
   test_find_header();
+  test_log_copy();
+  test_socks_reply();
   test_token_file();
   return 0;
 }

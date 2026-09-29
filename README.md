@@ -1,6 +1,6 @@
 # termux-http-proxy
 
-A high-performance, ultra-lightweight, zero-copy HTTP `CONNECT` forward proxy for Android/Termux environments.
+A high-performance, ultra-lightweight, zero-copy HTTP `CONNECT` and SOCKS5 forward proxy for Android/Termux environments.
 
 ## Why this exists
 
@@ -20,7 +20,9 @@ On Android:
 * **Zero-copy:** Forwards stream data between sockets entirely in kernel space via `splice(2)` and circular pipes.
 * **Nothing blocks the loop:** Names are resolved with Android's asynchronous resolver, whose answers arrive on file descriptors that `epoll` watches like any socket; A and AAAA are asked in parallel. Upstream connects are non-blocking. One slow lookup or unreachable host no longer stalls every other tunnel.
 * **Per-address connect deadlines:** Each resolved address gets an equal share of the 5s connect budget, so a blackholed IPv6 address cannot eat the time an IPv4 one needs. IPv4 is tried first. Once one of A/AAAA has answered with addresses, the other gets 50ms to catch up (RFC 8305's Resolution Delay) before the proxy dials what it has, so a slow or dropped AAAA query costs 50ms rather than the 10s DNS budget.
-* **Optional authentication:** `--auth-file` requires a token before anything is resolved or dialed (see [Security](#security)).
+* **HTTP and SOCKS5 on one port:** HTTP `CONNECT`, plain HTTP, and SOCKS5 `CONNECT` with names resolved by the proxy (`socks5h://`). The first byte tells them apart. See [SOCKS5](#socks5).
+* **Optional authentication:** `--auth-file` requires a token before anything is resolved or dialed, over HTTP and SOCKS5 alike (see [Security](#security)).
+* **Connection log:** `--log` writes a line per connection: where it went, which tool asked, bytes each way, how long, and why it failed if it did (see [Logging](#logging)).
 * **Low memory overhead:** ~3MB RSS / ~700KB PSS, idle or with tunnels open.
 * **0% idle CPU:** Single-threaded event loop driven by `epoll(7)`. With no connection mid-setup, it sleeps with an infinite timeout; deadlines only wake it while something is pending.
 * **Automatic lifecycle cleanup:** In coprocess mode it watches `stdin` and the parent PID, and exits as soon as the parent does. No orphan processes.
@@ -38,7 +40,7 @@ This installs `termux-http-proxy` and `termux-http-proxy-ctl` into `$PREFIX/bin`
 ## Usage
 
 ```
-termux-http-proxy [--port PORT | PORT] [-f | -d] [--auth-file PATH]
+termux-http-proxy [--port PORT | PORT] [-f | -d] [--auth-file PATH] [--log PATH]
 ```
 
 ### Run as a background helper (coprocess mode)
@@ -101,6 +103,39 @@ export HTTP_PROXY="$HTTPS_PROXY"
 
 The header is stripped from plain-HTTP requests before they are forwarded.
 
+SOCKS5 clients authenticate with username/password (RFC 1929), again with any username and the token as the password. With `--auth-file`, a SOCKS5 client that does not offer that method is turned away before it can send a request.
+
+## SOCKS5
+
+The same port speaks SOCKS5 (RFC 1928). Only the `CONNECT` command is supported: `BIND` and `UDP ASSOCIATE` get reply 7 (command not supported). Targets can be IPv4, IPv6 or a domain name; use `socks5h://` so the proxy resolves names through Android's resolver, which is the reason this proxy exists:
+
+```bash
+curl -x "socks5h://proxy:$TOKEN@127.0.0.1:18080" https://example.com
+export ALL_PROXY="socks5h://proxy:$TOKEN@127.0.0.1:18080"
+```
+
+Clients may send their greeting, credentials and request without waiting for the replies. Failures come back as SOCKS5 reply codes: 4 (host unreachable) for names that do not resolve and for timeouts, 5 for a refused connection, 3 when there is no route to the address family.
+
+## Logging
+
+`--log PATH` appends a line per connection to `PATH` (created with mode `0600`), written when the connection ends:
+
+```
+2026-09-29 10:17:56 socks5 example.com:443 user=claude addr=172.66.147.243 result=ok up=1921 down=6577 time=0.085s
+2026-09-29 10:17:56 connect evil.test:443 user=- addr=- result=auth-failed up=0 down=0 time=0.001s
+2026-09-29 10:17:56 socks5 no-such-host.invalid:443 user=claude addr=- result=nxdomain up=0 down=0 time=0.007s
+```
+
+* **Protocol:** `connect`, `http` or `socks5`.
+* **`user`:** the username the client authenticated with. Since any username is accepted, a launcher can put its own name in the proxy URL (`http://claude:$TOKEN@…`) to show up in the log.
+* **`addr`:** the address actually connected to.
+* **`up`/`down`:** bytes from the client to the target and back.
+* **`result`:** `ok`, or `auth-failed`, `nxdomain`, `no-address`, `dns-timeout`, `refused`, `unreachable`, `connect-timeout`, `bad-request`, `unsupported`, `header-timeout`, `client-left`, and the like.
+
+Only the host and port are logged, never a plain-HTTP path or query, and client-supplied text is sanitised so it cannot forge fields or lines. A tunnel is logged when it closes, so a long-lived connection appears once it ends.
+
+`--log -` writes to stderr without timestamps, for a supervisor that adds its own (runit's `svlogd -tt`): add it to the service's `run` line and read the log with `tail -f $PREFIX/var/log/sv/termux-http-proxy/current`. It needs `-f` or coprocess mode, since a detached daemon has no stderr.
+
 ## How resolution works
 
 Android exposes an asynchronous DNS API (`android_res_nquery`, API 29+) that goes through the same system resolver as `getaddrinfo`, so Private DNS and per-network servers apply, but returns a file descriptor instead of blocking.
@@ -122,9 +157,9 @@ make test-network    # also resolves real names through Android's resolver
 
 All builds happen in temporary directories under AddressSanitizer (`-fsanitize=address`):
 
-* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, authentication (including real `curl` with credentials in the proxy URL), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
-* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
-* **`tests/test_event_loop.c`** — runs the real event loop with a fake resolver and a `connect()` that can blackhole chosen addresses: a stalled lookup does not block other clients, NXDOMAIN, a partial A/AAAA answer is dialed after the resolution delay (and an empty one starts no delay), a blackholed address falls through to the next, all-blackholed times out with `504`, IPv4-first ordering, clients hanging up mid-lookup, and IPv6 dialing.
+* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, SOCKS5 (pipelined and byte-at-a-time handshakes, every address type, reply codes, unsupported commands), authentication over HTTP and SOCKS5 (including real `curl` with credentials in `http://` and `socks5h://` proxy URLs), the connection log (byte counts, refusals, nothing secret logged), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
+* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, log sanitising, SOCKS5 replies, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
+* **`tests/test_event_loop.c`** — runs the real event loop with a fake resolver and a `connect()` that can blackhole chosen addresses: a stalled lookup does not block other clients, NXDOMAIN, a partial A/AAAA answer is dialed after the resolution delay (and an empty one starts no delay), a blackholed address falls through to the next, all-blackholed times out with `504`, IPv4-first ordering, clients hanging up mid-lookup, IPv6 dialing, and SOCKS5 through the same paths.
 * **`tests/measure_memory.py`** — RSS/PSS footprint benchmark, optionally against a Bun implementation (`--bun-js`).
 
 ## Used by
