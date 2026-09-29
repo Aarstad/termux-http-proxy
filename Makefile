@@ -20,9 +20,10 @@ install: $(TARGET)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/.$(TARGET).new
 	mv -f $(DESTDIR)$(BINDIR)/.$(TARGET).new $(DESTDIR)$(BINDIR)/$(TARGET)
 	install -m 755 $(TARGET)-ctl $(DESTDIR)$(BINDIR)/$(TARGET)-ctl
+	install -m 755 $(TARGET)-blocklists $(DESTDIR)$(BINDIR)/$(TARGET)-blocklists
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)-ctl
+	rm -f $(DESTDIR)$(BINDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)-ctl $(DESTDIR)$(BINDIR)/$(TARGET)-blocklists
 
 # test_proxy.py also builds and runs the C suites (tests/test_units.c, tests/test_event_loop.c).
 test:

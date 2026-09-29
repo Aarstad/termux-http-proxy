@@ -350,15 +350,25 @@ static void test_socks_reply(void) {
   close(fd);
 }
 
+static void write_text(const char *path, const char *text) {
+  FILE *f = fopen(path, "w");
+  assert(f && fputs(text, f) >= 0 && fclose(f) == 0);
+}
+
+static void reset_deny(void) {
+  deny_free(&deny);
+  ndeny_paths = 0;
+}
+
 // Listed domains match themselves and their subdomains, and nothing else.
 static void test_deny_list(void) {
   char path[] = "/data/data/com.termux/files/usr/tmp/deny-XXXXXX";
   int fd = mkstemp(path);
   assert(fd >= 0);
-  const char *text = "# telemetry\n  DataDogHQ.com  # trailing comment\n*.wild.test\n.dot.test.\n\n  \n";
-  assert(write(fd, text, strlen(text)) == (ssize_t)strlen(text));
   close(fd);
-  assert(load_deny(path) == 3);
+  write_text(path, "# telemetry\n  DataDogHQ.com  # trailing comment\n*.wild.test\n.dot.test.\n\n  \n");
+  deny_paths[ndeny_paths++] = path;
+  assert(load_deny() == 3);
   assert(host_denied("datadoghq.com"));
   assert(host_denied("http-intake.logs.us5.datadoghq.com"));
   assert(host_denied("HTTP-Intake.DATADOGHQ.com."));
@@ -370,11 +380,83 @@ static void test_deny_list(void) {
   assert(!host_denied("anthropic.com"));
   // An unreadable file keeps the list in force.
   unlink(path);
-  assert(load_deny(path) == -1);
+  assert(load_deny() == -1);
   assert(host_denied("datadoghq.com"));
-  free(deny_list);
-  deny_list = NULL;
-  deny_size = 0;
+  reset_deny();
+}
+
+// Blocklist formats: domain lists, hosts files, AdBlock rules, and "@@" allow entries,
+// across several files. Everything that is not a whole-domain rule is skipped.
+static void test_deny_formats(void) {
+  char a[] = "/data/data/com.termux/files/usr/tmp/deny-a-XXXXXX";
+  char b[] = "/data/data/com.termux/files/usr/tmp/deny-b-XXXXXX";
+  close(mkstemp(a));
+  close(mkstemp(b));
+  write_text(a,
+             "0.0.0.0 0.0.0.0\n"
+             "127.0.0.1 localhost\n"
+             "255.255.255.255 broadcasthost\n"
+             "::1 ip6-localhost ip6-loopback\n"
+             "0.0.0.0 ads.hosts.test tracker.hosts.test # two names on one line\n"
+             "0.0.0.0\tTABBED.hosts.test\r\n"
+             "plain.test\n"
+             "shared.test\n"
+             "192.0.2.1\n");
+  write_text(b,
+             "[Adblock Plus 2.0]\n"
+             "! Title: test\n"
+             "||adblock.test^\n"
+             "||options.test^$third-party\n"
+             "||path.test/ads/*\n"
+             "example.org##.banner\n"
+             "example.net#@#.ad\n"
+             "@@||good.shared.test^\n"
+             "@@allowed.test\n"
+             "allowed.test\n"
+             "/regex[0-9]+/\n"
+             "*.wild2.test\n");
+  deny_paths[ndeny_paths++] = a;
+  deny_paths[ndeny_paths++] = b;
+  int n = load_deny();
+  assert(n == 7); // ads, tracker, tabbed, plain, shared, adblock, wild2
+  assert(host_denied("ads.hosts.test") && host_denied("tracker.hosts.test"));
+  assert(host_denied("x.tabbed.hosts.test"));
+  assert(host_denied("plain.test") && host_denied("adblock.test") && host_denied("a.wild2.test"));
+  assert(!host_denied("localhost") && !host_denied("broadcasthost") && !host_denied("ip6-localhost"));
+  assert(!host_denied("options.test") && !host_denied("path.test"));
+  assert(!host_denied("example.org") && !host_denied("example.net"));
+  // Allow beats deny, from any file and at any depth.
+  assert(host_denied("shared.test") && host_denied("bad.shared.test"));
+  assert(!host_denied("good.shared.test") && !host_denied("x.good.shared.test"));
+  assert(!host_denied("allowed.test"));
+  assert(deny.allows == 2);
+  unlink(a);
+  unlink(b);
+  reset_deny();
+}
+
+// A blocklist-sized set: every entry found, near misses not, and lookups stay cheap.
+static void test_deny_large(void) {
+  char path[] = "/data/data/com.termux/files/usr/tmp/deny-big-XXXXXX";
+  close(mkstemp(path));
+  FILE *f = fopen(path, "w");
+  assert(f);
+  for (int i = 0; i < 200000; i++) fprintf(f, "host%d.tracker%d.test\n", i, i % 997);
+  fclose(f);
+  deny_paths[ndeny_paths++] = path;
+  assert(load_deny() == 200000);
+  char name[64];
+  int64_t t0 = monotonic_ms();
+  for (int i = 0; i < 200000; i++) {
+    snprintf(name, sizeof name, "cdn.host%d.tracker%d.test", i, i % 997);
+    assert(host_denied(name));
+    snprintf(name, sizeof name, "host%d.tracker%d.test", i, (i + 1) % 997);
+    assert(!host_denied(name));
+  }
+  // 400k lookups; the old linear scan would take hours. Generous for ASan builds.
+  assert(monotonic_ms() - t0 < 10000);
+  unlink(path);
+  reset_deny();
 }
 
 // DNS query names, for the deny list: one question, no compression.
@@ -491,6 +573,8 @@ int main(void) {
   test_log_copy();
   test_socks_reply();
   test_deny_list();
+  test_deny_formats();
+  test_deny_large();
   test_query_name();
   test_socks_addr();
   test_token_file();

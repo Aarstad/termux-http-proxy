@@ -923,6 +923,27 @@ class DenyTests(unittest.TestCase):
         self.assertIn(b'reread', self.errors)
         self.assertIn(b'cannot open', self.errors)
 
+    def test_blocklists_and_allow_entries(self):
+        # A hosts-format blocklist alongside the user's list, whose @@ entry wins.
+        extra = Path(self.temp.name) / 'hosts'
+        extra.write_text('0.0.0.0 tracker.invalid\n0.0.0.0 cdn.tracker.invalid\n')
+        self.deny.write_text('@@cdn.tracker.invalid\n')
+        proxy = subprocess.Popen([self.binary, '--deny-file', str(self.deny), '--deny-file', str(extra)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            port = int(proxy.stdout.readline())
+            with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
+                client.sendall(b'CONNECT x.tracker.invalid:443 HTTP/1.1\r\n\r\n')
+                self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 403 '))
+            with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
+                # Allowed, so it is looked up, and .invalid names do not exist.
+                client.sendall(b'CONNECT cdn.tracker.invalid:443 HTTP/1.1\r\n\r\n')
+                self.assertTrue(client.recv(4096).startswith(b'HTTP/1.1 502 '))
+        finally:
+            proxy.terminate()
+            _, errors = proxy.communicate(timeout=5)
+        self.assertNotIn(b'ERROR: AddressSanitizer', errors)
+
     def test_missing_deny_file_refused_at_start(self):
         result = subprocess.run([self.binary, '--deny-file', str(Path(self.temp.name) / 'nope')],
                                 capture_output=True, timeout=5)

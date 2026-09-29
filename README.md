@@ -23,7 +23,7 @@ On Android:
 * **HTTP and SOCKS5 on one port:** HTTP `CONNECT`, plain HTTP, and SOCKS5 `CONNECT` with names resolved by the proxy (`socks5h://`) and `UDP ASSOCIATE`. The first byte tells them apart. See [SOCKS5](#socks5).
 * **DNS over SOCKS5 UDP through Android's resolver:** datagrams to port 53 are answered by the system resolver, so they get Private DNS and work where raw port-53 traffic is blocked; denied names get `NXDOMAIN`.
 * **Optional authentication:** `--auth-file` requires a token before anything is resolved or dialed, over HTTP and SOCKS5 alike, UDP included (see [Security](#security)).
-* **Deny list:** `--deny-file` refuses listed domains and their subdomains before anything is resolved or dialed; `sv hup` rereads it (see [Deny list](#deny-list)).
+* **Deny list and blocklists:** `--deny-file` (repeatable) refuses listed domains and their subdomains before anything is resolved or dialed. It reads domain lists, hosts files and AdBlock `||domain^` rules, with `@@` allow entries, and holds hundreds of thousands of names in a hash table. `termux-http-proxy-blocklists` subscribes to lists and keeps them fresh (see [Deny list](#deny-list)).
 * **Connection log:** `--log` writes a line per connection: where it went, which tool asked, bytes each way, how long, and why it failed if it did (see [Logging](#logging)).
 * **Low memory overhead:** ~3MB RSS / ~700KB PSS, idle or with tunnels open.
 * **0% idle CPU:** Single-threaded event loop driven by `epoll(7)`. With no connection mid-setup, it sleeps with an infinite timeout; deadlines only wake it while something is pending.
@@ -37,7 +37,7 @@ make
 make install
 ```
 
-This installs `termux-http-proxy` and `termux-http-proxy-ctl` into `$PREFIX/bin`. Earlier copies of this proxy, bundled with claude-code-termux-musl, agy-termux-musl and codex-termux, were called `dns-proxy`.
+This installs `termux-http-proxy`, `termux-http-proxy-ctl` and `termux-http-proxy-blocklists` into `$PREFIX/bin`. Earlier copies of this proxy, bundled with claude-code-termux-musl, agy-termux-musl and codex-termux, were called `dns-proxy`.
 
 ## Usage
 
@@ -134,17 +134,37 @@ The association is logged as one `socks5-udp` line when it ends: the first desti
 
 ## Deny list
 
-`--deny-file PATH` refuses connections to the domains listed in `PATH`, and to all their subdomains, before any lookup or connection: HTTP clients get `403 Forbidden`, SOCKS5 clients reply 2 (not allowed by ruleset), DNS queries over SOCKS5 UDP get `NXDOMAIN`, and the log says `result=blocked`.
+`--deny-file PATH` refuses connections to the domains listed in `PATH`, and to all their subdomains, before any lookup or connection: HTTP clients get `403 Forbidden`, SOCKS5 clients reply 2 (not allowed by ruleset), DNS queries over SOCKS5 UDP get `NXDOMAIN`, and the log says `result=blocked`. Give it once per file, up to 32 times.
 
 ```
 # ~/.config/termux-http-proxy/deny
 datadoghq.com        # also blocks http-intake.logs.us5.datadoghq.com
 *.example.net        # "*." and a leading "." are optional
+@@cdn.example.net    # allowed, whatever this or any other file says
 ```
 
-One domain per line; `#` starts a comment; matching ignores case and a trailing dot. `SIGHUP` rereads the file (`sv hup termux-http-proxy` under runit), and a file that has become unreadable leaves the previous list in force; at startup a missing file is an error.
+Each file may be a plain domain list, a hosts file (`0.0.0.0 ads.example.com`; `localhost` and the like are skipped) or an AdBlock-style list, of which the `||domain^` rules are used and rules with options (`$third-party`), paths or element hiding (`##`) are skipped, since they are not about whole domains. `@@` in front of an entry allows that domain and its subdomains from any file. Matching ignores case and a trailing dot.
+
+The names go into one hash table, so a lookup costs a probe per label of the host however long the lists are: 60,000 domains take the proxy from about 3MB to 5MB RSS.
+
+`SIGHUP` rereads every file (`sv hup termux-http-proxy` under runit); if one has become unreadable, the previous lists stay in force. At startup a missing file is an error.
 
 It matches the name a client asks for. A client that connects to an IP address directly, or uses its own DNS-over-HTTPS, is not caught by a domain rule.
+
+### Blocklists
+
+`termux-http-proxy-blocklists` subscribes to published lists and keeps them fresh:
+
+```bash
+termux-http-proxy-blocklists defaults      # HaGeZi Multi PRO mini + native Huawei/Honor trackers
+termux-http-proxy-blocklists add NAME URL  # any domain, hosts or AdBlock list over https
+termux-http-proxy-blocklists list          # entries and age of each
+termux-http-proxy-blocklists update        # download again; the proxy rereads them
+termux-http-proxy-blocklists check ads.example.com   # which list blocks it, and by which line
+termux-http-proxy-blocklists remove NAME
+```
+
+Subscriptions are kept in `~/.config/termux-http-proxy/blocklists.conf` and the lists in `~/.local/share/termux-http-proxy/blocklists/`. A download replaces its list only if it looks like one (not HTML, at least 10 entries, under 50MB). The service's `run` passes each list with `--deny-file`, so adding or removing one restarts the proxy, while an update only rereads them.
 
 ## Logging
 
@@ -187,8 +207,8 @@ make test-network    # also resolves real names through Android's resolver
 
 All builds happen in temporary directories under AddressSanitizer (`-fsanitize=address`):
 
-* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, SOCKS5 (pipelined and byte-at-a-time handshakes, every address type, reply codes, unsupported commands), authentication over HTTP and SOCKS5 (including real `curl` with credentials in `http://` and `socks5h://` proxy URLs), the connection log (byte counts, refusals, nothing secret logged), SOCKS5 UDP (round trips over IPv4 and IPv6, 60KB datagrams, strangers ignored on both sides, the declared client port, malformed datagrams, teardown with the control connection, descriptors released), the deny list (HTTP, SOCKS5 and DNS `NXDOMAIN`, no lookup for blocked names, live reload), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
-* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, log sanitising, deny-list matching, DNS query and SOCKS5 UDP address parsing, SOCKS5 replies, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
+* **`tests/test_proxy.py`** — loopback functional tests: HTTP header rewriting, tunneling, early payload forwarding, chunked encoding rejection, backpressure and teardown, `localhost` and bracketed IPv6 targets, malformed targets, SOCKS5 (pipelined and byte-at-a-time handshakes, every address type, reply codes, unsupported commands), authentication over HTTP and SOCKS5 (including real `curl` with credentials in `http://` and `socks5h://` proxy URLs), the connection log (byte counts, refusals, nothing secret logged), SOCKS5 UDP (round trips over IPv4 and IPv6, 60KB datagrams, strangers ignored on both sides, the declared client port, malformed datagrams, teardown with the control connection, descriptors released), the deny list (HTTP, SOCKS5 and DNS `NXDOMAIN`, no lookup for blocked names, several files with `@@` allow entries, live reload), argument handling, header timeouts in both coprocess and `-f` mode, and a release-build footprint limit. It also builds and runs the C suites below.
+* **`tests/test_units.c`** — DNS answer parsing (compressed names, CNAME chains, every truncation of a valid message, hostile counts), host/port parsing, credential checks, log sanitising, deny-list matching and blocklist formats (hosts files, AdBlock rules and what is skipped, allow entries, a 200,000-domain list), DNS query and SOCKS5 UDP address parsing, SOCKS5 replies, token-file creation and refusal, write deadlines under `EINTR`, and tunnel backpressure.
 * **`tests/test_event_loop.c`** — runs the real event loop with a fake resolver and a `connect()` that can blackhole chosen addresses: a stalled lookup does not block other clients, NXDOMAIN, a partial A/AAAA answer is dialed after the resolution delay (and an empty one starts no delay), a blackholed address falls through to the next, all-blackholed times out with `504`, IPv4-first ordering, clients hanging up mid-lookup, IPv6 dialing, SOCKS5 through the same paths, and DNS over SOCKS5 UDP (the answer's ID and source, a stalled query expiring without harming the association).
 * **`tests/measure_memory.py`** — RSS/PSS footprint benchmark, optionally against a Bun implementation (`--bun-js`).
 
