@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -229,6 +230,33 @@ class ProxyTests(unittest.TestCase):
             reverse.result(timeout=15)
         self.assertEqual(conn.recv(1), b'')
         self.assertEqual(self.client.recv(1), b'')
+
+    def cpu_seconds(self):
+        fields = Path(f'/proc/{self.proxy.pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')
+
+    def test_half_closed_then_reset_client_does_not_spin(self):
+        # The client sends, half-closes, then resets, while the server end stays open.
+        # The proxy used to see EPOLLHUP on every wait from then on: 100% CPU for as long
+        # as the server kept its end open.
+        self.client.sendall(f'CONNECT {self.target} HTTP/1.1\r\n\r\n'.encode())
+        conn = self.upstream()
+        self.assertTrue(self.client.recv(4096).startswith(b'HTTP/1.1 200 '))
+        self.client.sendall(b'last words')
+        self.client.shutdown(socket.SHUT_WR)
+        self.assertEqual(self.receive(conn, 10), b'last words')
+        self.assertEqual(conn.recv(10), b'')  # The half-close was passed on
+        self.client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        self.client.close()  # RST
+        before = self.cpu_seconds()
+        time.sleep(1)
+        self.assertLess(self.cpu_seconds() - before, 0.2)
+        # And the tunnel is gone: the server end gets EOF or a reset.
+        conn.settimeout(3)
+        try:
+            self.assertEqual(conn.recv(10), b'')
+        except ConnectionResetError:
+            pass
 
     def test_localhost_by_name(self):
         self.client.sendall(f'CONNECT localhost:{self.server.getsockname()[1]} HTTP/1.1\r\n\r\n'.encode())
